@@ -870,6 +870,24 @@ export default function Page() {
       return "Join did not sync. Copy debug log and send it.";
     }
 
+    function lobbyMessageRows(snapshot) {
+      const rows = [];
+      snapshot.forEach(child => {
+        const value = child.val();
+        if (!value || typeof value !== "object") return;
+        rows.push({
+          id: child.key,
+          name: sanitizeName(value.name) || "Guest",
+          text: String(value.text || "").trim().slice(0, 120),
+          ts: Number(value.ts || 0)
+        });
+      });
+      return rows
+        .filter(message => message.text)
+        .sort((a, b) => (b.ts || 0) - (a.ts || 0) || String(b.id).localeCompare(String(a.id)))
+        .slice(0, 50);
+    }
+
     function toast(message) {
       const wrap = document.getElementById("toasts");
       const el = document.createElement("div");
@@ -1096,8 +1114,15 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
               </div>
             </section>
             <section class="panel" style="box-shadow:none">
-              <h2 class="section-title">Lobby Comments</h2>
-              <div class="lobby-messages" aria-live="polite">
+              <div class="between">
+                <h2 class="section-title" style="margin:0">Lobby Comments</h2>
+                <span class="mono mini">${state.lobbyMessages.length}</span>
+              </div>
+              <div class="lobby-comment-meta">
+                <span>Newest first</span>
+                ${state.lobbyMessages.length > 5 ? `<span>Scroll for older</span>` : ""}
+              </div>
+              <div class="lobby-messages" aria-live="polite" tabindex="0">
                 ${state.lobbyMessages.length ? state.lobbyMessages.map(message => `
                   <div class="feed-row">
                     ${avatar(message.name)}
@@ -2671,10 +2696,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       attachRosterListener();
       if (lobbyListenerAttached) return;
       lobbyListenerAttached = true;
-      ref("lobbyMessages").orderByChild("ts").limitToLast(30).on("value", snap => {
-        const rows = [];
-        snap.forEach(child => rows.push({ id: child.key, ...child.val() }));
-        state.lobbyMessages = rows.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      ref("lobbyMessages").on("value", snap => {
+        state.lobbyMessages = lobbyMessageRows(snap);
         state.loaded.lobby = true;
         render();
       });
