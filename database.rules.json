@@ -16,7 +16,7 @@
     "players": {
       "$uid": {
         ".read": "auth != null && auth.uid === $uid",
-        ".write": "auth != null && auth.uid === $uid && now >= 1781938800000",
+        ".write": "auth != null && auth.uid === $uid",
         ".validate": "newData.hasChildren(['name', 'codeHash', 'joinedAt']) && newData.child('name').isString() && newData.child('name').val().length > 0 && newData.child('name').val().length <= 24 && root.child('invitedNames').child(newData.child('name').val()).val() === true && newData.child('codeHash').isString() && newData.child('codeHash').val() === root.child('inviteCodes').child(newData.child('name').val()).child('hash').val() && newData.child('joinedAt').isNumber()"
       }
     },
@@ -24,7 +24,7 @@
     "playerNames": {
       "$name": {
         ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
-        ".write": "auth != null && now >= 1781938800000 && root.child('players').child(auth.uid).child('name').val() === $name && newData.val() === auth.uid",
+        ".write": "auth != null && root.child('players').child(auth.uid).child('name').val() === $name && newData.val() === auth.uid",
         ".validate": "newData.isString()"
       }
     },
@@ -32,8 +32,25 @@
     "roster": {
       ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
       "$name": {
-        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name",
+        ".write": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name",
         ".validate": "newData.val() === true"
+      }
+    },
+
+    "lobbyMessages": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      ".indexOn": ["ts"],
+      "$id": {
+        ".write": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && ((!data.exists() && newData.exists() && newData.child('name').val() === root.child('players').child(auth.uid).child('name').val()) || (data.exists() && !newData.exists() && data.child('name').val() === root.child('players').child(auth.uid).child('name').val()))",
+        ".validate": "!newData.exists() || (newData.hasChildren(['name', 'text', 'ts']) && newData.child('name').isString() && newData.child('text').isString() && newData.child('text').val().length > 0 && newData.child('text').val().length <= 120 && newData.child('ts').isNumber())"
+      }
+    },
+
+    "gameStarts": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "$name": {
+        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name",
+        ".validate": "newData.hasChildren(['ts']) && newData.child('ts').isNumber() && (!newData.child('id').exists() || (newData.child('id').isString() && newData.child('id').val().length > 0 && newData.child('id').val().length <= 80))"
       }
     },
 

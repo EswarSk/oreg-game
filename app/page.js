@@ -276,7 +276,7 @@ export default function Page() {
     const TRIP_DEPART_AT = new Date("2026-06-20T07:00:00-07:00").getTime();
     const TRIP_WRAP_AT = new Date("2026-06-22T00:00:00-07:00").getTime();
     const TRIP_OPEN_LABEL = "June 20, 2026 at 12:00 AM PT";
-    const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice"]);
+    const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice", "join", "postLobbyComment"]);
 
     const app = document.getElementById("app");
     const photoInput = document.getElementById("photoInput");
@@ -290,6 +290,8 @@ export default function Page() {
     let historyQuery = null;
     let handRef = null;
     let globalListenersAttached = false;
+    let rosterListenerAttached = false;
+    let lobbyListenerAttached = false;
     let countdownTimer = null;
     let rankDotTimer = null;
     let repairingHandFor = "";
@@ -328,6 +330,8 @@ export default function Page() {
       stopVotes: {},
       routeProgress: {},
       feed: [],
+      lobbyMessages: [],
+      lobbyDraft: "",
       hand: [],
       hotseat: null,
       history: [],
@@ -346,7 +350,7 @@ export default function Page() {
       seenFullTank: false,
       loaded: {
         roster: false, scores: false, hype: false, votes: false, feed: false,
-        hotseat: false, hand: false, photos: false, history: false, claims: false, stopVotes: false, routeProgress: false, invites: false
+        hotseat: false, hand: false, photos: false, history: false, claims: false, stopVotes: false, routeProgress: false, invites: false, lobby: false
       }
     };
 
@@ -355,7 +359,7 @@ export default function Page() {
     }
 
     function tripLocked() {
-      return !localMode && Date.now() < TRIP_OPEN_AT;
+      return Date.now() < TRIP_OPEN_AT && (!localMode || localLobbyPreview());
     }
 
     function ensureTripOpen() {
@@ -418,6 +422,11 @@ export default function Page() {
 
     function localBypassAllowed() {
       return localRequested() && localHostAllowed();
+    }
+
+    function localLobbyPreview() {
+      const params = new URLSearchParams(location.search);
+      return localHostAllowed() && localRequested() && (params.get("lobby") === "1" || params.get("pretrip") === "1");
     }
 
     function localResetRequested() {
@@ -658,12 +667,17 @@ export default function Page() {
       });
       state.mode = "app";
       state.connected = true;
-      attachGlobalListeners();
-      if (state.name) {
-        attachPlayerListeners();
-        ensureLocalPlayerJoined();
+      attachLobbyListeners();
+      if (!tripLocked()) {
+        attachGlobalListeners();
+        if (state.name) {
+          attachPlayerListeners();
+          ensureLocalPlayerJoined();
+        }
+        prepareActiveTab();
+      } else if (state.name) {
+        ensureLocalLobbyJoined();
       }
-      prepareActiveTab();
       startCountdown();
       render();
     }
@@ -834,6 +848,36 @@ export default function Page() {
       }
     }
 
+    async function postLobbyComment() {
+      if (!state.name) return toast("Join the lobby first.");
+      const text = String(state.lobbyDraft || document.getElementById("lobbyCommentInput")?.value || "").trim().slice(0, 120);
+      if (!text) return toast("Write a comment first.");
+      try {
+        await ref("lobbyMessages").push({ name: state.name, text, ts: Date.now() });
+        state.lobbyDraft = "";
+        render();
+        pruneLobbyMessages();
+      } catch (error) {
+        toast("Lobby comment did not post.");
+        console.warn(error);
+      }
+    }
+
+    async function pruneLobbyMessages() {
+      try {
+        const snap = await ref("lobbyMessages").orderByChild("ts").once("value");
+        const rows = [];
+        snap.forEach(child => rows.push([child.key, child.val()?.ts || 0, child.val()?.name || ""]));
+        rows
+          .sort((a, b) => b[1] - a[1])
+          .slice(80)
+          .filter(([, , name]) => name === state.name)
+          .forEach(([key]) => ref(`lobbyMessages/${key}`).remove());
+      } catch (error) {
+        console.warn(error);
+      }
+    }
+
     async function addScore(name, delta, target) {
       if (!name || !delta) return;
       try {
@@ -871,26 +915,58 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function render() {
       if (state.mode === "setup") return setupScreen();
-      if (tripLocked()) return renderTripLock();
-      if (state.revealCards) return renderReveal();
       if (!state.name) return renderJoin();
+      if (tripLocked()) return renderLobby();
+      if (state.revealCards) return renderReveal();
       renderApp();
     }
 
-    function renderTripLock() {
+    function renderLobby() {
+      const joined = state.roster.length ? state.roster : [state.name].filter(Boolean);
       app.innerHTML = `
-        <main class="join">
+        <main class="join lobby">
           <div class="logo" style="margin:auto">OREGON<span>OR BUST</span><small>Seattle -> Oregon</small></div>
-          <section class="join-card stack">
-            <div>
-              <h1 class="title">Trip Opens Soon</h1>
-              <p class="muted">Game actions unlock ${TRIP_OPEN_LABEL}.</p>
+          <section class="join-card stack lobby-card">
+            <div class="between">
+              <div>
+                <h1 class="title">Lobby</h1>
+                <p class="muted">Game actions unlock ${TRIP_OPEN_LABEL}.</p>
+              </div>
+              <div class="lobby-you">${avatar(state.name)}<span>${escapeHtml(state.name)}</span></div>
             </div>
-            <p>The road-trip board is locked until trip day, so nobody can join, score points, play cards, upload photos, react, or complete levels early.</p>
+            <div class="lobby-road" aria-hidden="true">
+              <span>Seattle</span>
+              <i></i>
+              <strong>Oregon</strong>
+            </div>
             <section class="panel sand" style="box-shadow:none">
               <h2 class="section-title" data-countdown-title>Unlock Countdown</h2>
               ${countdownHtml(TRIP_OPEN_AT)}
             </section>
+            <section class="panel" style="box-shadow:none">
+              <div class="between">
+                <h2 class="section-title" style="margin:0">Checked In</h2>
+                <span class="mono mini">${joined.length}</span>
+              </div>
+              <div class="avatar-cloud">
+                ${joined.map(name => `<div class="lobby-avatar">${avatar(name)}<span>${escapeHtml(name)}${name === state.name ? " (you)" : ""}</span></div>`).join("")}
+              </div>
+            </section>
+            <section class="panel" style="box-shadow:none">
+              <h2 class="section-title">Lobby Comments</h2>
+              <div class="lobby-messages" aria-live="polite">
+                ${state.lobbyMessages.length ? state.lobbyMessages.map(message => `
+                  <div class="feed-row">
+                    ${avatar(message.name)}
+                    <div><strong>${escapeHtml(message.name)}</strong><br>${escapeHtml(message.text)}</div>
+                    <time class="mono mini muted">${formatTime(message.ts)}</time>
+                  </div>`).join("") : `<div class="empty">No comments yet. Drop the first road-trip thought.</div>`}
+              </div>
+              <label class="field-label" for="lobbyCommentInput">Comment</label>
+              <input id="lobbyCommentInput" data-field="lobbyDraft" maxlength="120" autocomplete="off" placeholder="Hype, snack requests, arrival plans..." value="${escapeHtml(state.lobbyDraft)}">
+              <button class="btn" data-action="postLobbyComment">POST COMMENT</button>
+            </section>
+            <p class="muted mini" style="margin:0">You are checked in. Points, cards, photos, route levels, and hot seat stay locked until trip day.</p>
           </section>
         </main>`;
     }
@@ -900,6 +976,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const inviteReady = localMode || state.loaded.invites;
       const selectedName = sanitizeName(state.nameDraft) || names[0] || "";
       const nameOptions = names.map(name => `<option value="${escapeHtml(name)}" ${name === selectedName ? "selected" : ""}>${escapeHtml(name)}</option>`).join("");
+      const preTrip = tripLocked();
       app.innerHTML = `
         <main class="join">
           <div class="logo" style="margin:auto">OREGON<span>OR BUST</span><small>Seattle -> Oregon</small></div>
@@ -908,7 +985,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
               <h1 class="title">Seattle -> Oregon</h1>
               <p class="muted">June 20-21, 2026</p>
             </div>
-            <p>Pick your invited name and enter your trip code. Joining earns <strong>+25 pts</strong> and deals <strong>2 secret wild cards</strong>.</p>
+            <p>${preTrip ? "Pick your invited name and enter your trip code to check into the pre-trip lobby." : "Pick your invited name and enter your trip code. Joining earns <strong>+25 pts</strong> and deals <strong>2 secret wild cards</strong>."}</p>
             ${inviteReady && !names.length ? `<div class="empty">The invite list is not loaded yet. Add invited names and code hashes in Firebase before sharing the link.</div>` : ""}
             ${inviteReady && names.length ? `
               <label class="field-label" for="nameInput">Invited player</label>
@@ -917,7 +994,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
               </select>
               ${localMode ? "" : `<label class="field-label" for="inviteCodeInput">Trip code</label>
               <input id="inviteCodeInput" data-field="inviteCode" maxlength="32" autocomplete="one-time-code" placeholder="Private invite code" value="${escapeHtml(state.inviteCodeDraft)}">`}
-              <button class="btn" data-action="join">LET'S RIDE +25</button>
+              <button class="btn" data-action="join">${preTrip ? "JOIN LOBBY" : "LET'S RIDE +25"}</button>
             ` : `<div class="empty">Loading invite list...</div>`}
           </section>
         </main>`;
@@ -1732,13 +1809,15 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       storeName(clean);
       state.name = clean;
       state.nameDraft = clean;
-      attachGlobalListeners();
-      attachPlayerListeners();
-      prepareActiveTab();
+      attachLobbyListeners();
+      if (!tripLocked()) {
+        attachGlobalListeners();
+        attachPlayerListeners();
+        prepareActiveTab();
+      }
     }
 
     async function join() {
-      if (!ensureTripOpen()) return;
       const clean = sanitizeName(state.nameDraft || document.getElementById("nameInput")?.value);
       const allowed = invitedNameOptions();
       if (!clean) return toast("Pick your invited name first.");
@@ -1757,25 +1836,38 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           });
           await ref(`playerNames/${clean}`).set(user.uid);
         }
-        const result = await ref(`roster/${clean}`).transaction(current => current === true ? undefined : true);
-        let revealCards = null;
-        if (result.committed) {
-          revealCards = dealCards();
-          await ref(`hands/${clean}`).set(revealCards);
-        } else {
-          await ensurePlayerHand(clean);
-        }
+        await ref(`roster/${clean}`).transaction(current => current === true ? undefined : true);
         activatePlayerSession(clean);
-        if (result.committed) {
-          await addScore(clean, 25, document.querySelector("[data-action='join']"));
-          await pushFeed(`🚗 ${clean} hopped in the car (+25)`, clean);
-          state.revealCards = revealCards;
-        } else {
+        if (tripLocked()) {
+          toast("You are checked into the lobby.");
           state.revealCards = null;
+        } else {
+          await ensureGameEntry(clean, document.querySelector("[data-action='join']"));
         }
         render();
       } catch (error) {
         toast("Join did not sync. Try again.");
+        console.warn(error);
+      }
+    }
+
+    async function ensureGameEntry(name, target) {
+      if (!name || tripLocked()) return;
+      const startId = id();
+      try {
+        const result = await ref(`gameStarts/${name}`).transaction(current => {
+          if (current) return current;
+          return { id: startId, ts: Date.now() };
+        });
+        const firstGameStart = result.committed && result.snapshot.val()?.id === startId;
+        const cards = await ensurePlayerHand(name);
+        if (firstGameStart) {
+          await addScore(name, 25, target);
+          await pushFeed(`🚗 ${name} hopped in the car (+25)`, name);
+          if (cards && name === state.name) state.revealCards = cards;
+        }
+      } catch (error) {
+        toast("Game start did not sync. Try again.");
         console.warn(error);
       }
     }
@@ -1820,6 +1912,15 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         } else {
           await ensurePlayerHand(state.name);
         }
+      } catch (error) {
+        console.warn(error);
+      }
+    }
+
+    async function ensureLocalLobbyJoined() {
+      if (!localMode || !state.name || !tripLocked()) return;
+      try {
+        await ref(`roster/${state.name}`).transaction(current => current === true ? undefined : true);
       } catch (error) {
         console.warn(error);
       }
@@ -2339,11 +2440,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         state.connected = snap.val() !== false;
         render();
       });
-      ref("roster").on("value", snap => {
-        state.roster = snap.exists() ? Object.keys(snap.val()).sort((a, b) => a.localeCompare(b)) : [];
-        state.loaded.roster = true;
-        render();
-      });
+      attachRosterListener();
       ref("scores").on("value", snap => {
         state.scores = snap.val() || {};
         const leader = scoreRows()[0]?.[0] || "";
@@ -2406,6 +2503,29 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         render();
       });
       ensurePhotosListener();
+    }
+
+    function attachRosterListener() {
+      if (rosterListenerAttached) return;
+      rosterListenerAttached = true;
+      ref("roster").on("value", snap => {
+        state.roster = snap.exists() ? Object.keys(snap.val()).sort((a, b) => a.localeCompare(b)) : [];
+        state.loaded.roster = true;
+        render();
+      });
+    }
+
+    function attachLobbyListeners() {
+      attachRosterListener();
+      if (lobbyListenerAttached) return;
+      lobbyListenerAttached = true;
+      ref("lobbyMessages").orderByChild("ts").limitToLast(30).on("value", snap => {
+        const rows = [];
+        snap.forEach(child => rows.push({ id: child.key, ...child.val() }));
+        state.lobbyMessages = rows.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+        state.loaded.lobby = true;
+        render();
+      });
     }
 
     function attachInviteListener() {
@@ -2476,6 +2596,13 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     function startCountdown() {
       clearInterval(countdownTimer);
       countdownTimer = setInterval(() => {
+        if (!tripLocked() && state.name && !globalListenersAttached) {
+          attachGlobalListeners();
+          attachPlayerListeners();
+          prepareActiveTab();
+          ensureGameEntry(state.name).finally(() => render());
+          return;
+        }
         if (!tripLocked() && document.querySelector(".join-card [data-countdown]")) {
           render();
           return;
@@ -2520,6 +2647,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       if (action === "switchLocal") switchLocalPlayer();
       if (action === "resetLocal") resetLocalGame();
       if (action === "join") join();
+      if (action === "postLobbyComment") postLobbyComment();
       if (action === "finishReveal") { state.revealCards = null; render(); }
       if (action === "confirmChoice") { resolveConfirm(actionEl.dataset.choice); return; }
       if (action === "pump") pump(actionEl);
@@ -2543,6 +2671,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     document.addEventListener("input", event => {
       if (event.target.id === "nameInput") state.nameDraft = event.target.value;
       if (event.target.id === "inviteCodeInput") state.inviteCodeDraft = event.target.value;
+      if (event.target.dataset.field === "lobbyDraft") state.lobbyDraft = event.target.value;
       if (event.target.dataset.field === "caption") state.caption = event.target.value;
     });
 
@@ -2558,6 +2687,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         return;
       }
       if (event.key === "Enter" && event.target.id === "nameInput") join();
+      if (event.key === "Enter" && event.target.id === "lobbyCommentInput") postLobbyComment();
     });
 
     photoInput.addEventListener("change", event => handlePhotoFile(event.target.files?.[0]));
@@ -2661,13 +2791,14 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         state.authReady = Boolean(state.authUid);
         state.mode = "app";
         attachInviteListener();
-        if (state.authUid && !tripLocked()) {
+        if (state.authUid) {
           const profileSnap = await ref(`players/${state.authUid}`).once("value");
           const profile = profileSnap.val();
           const profileName = sanitizeName(profile?.name);
           if (profileName) {
             try { await ref(`playerNames/${profileName}`).set(state.authUid); } catch (claimError) { console.warn(claimError); }
             activatePlayerSession(profileName);
+            if (!tripLocked()) await ensureGameEntry(profileName);
           }
         }
         startCountdown();

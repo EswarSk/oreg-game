@@ -12,9 +12,9 @@ Mobile-only multiplayer road-trip game for the June 20-21, 2026 Seattle -> Orego
 6. In Realtime Database -> Rules, paste the contents of `database.rules.json` and publish them.
 7. Seed the invite list in Realtime Database before sharing the link.
 
-The rules block all game writes until **June 20, 2026 at 12:00 AM Pacific** (`1781938800000` in Firebase server time). The app also shows a locked countdown screen before then. Do not leave Realtime Database in test mode.
+The rules block game writes until **June 20, 2026 at 12:00 AM Pacific** (`1781938800000` in Firebase server time), but invited players can join before then. Before the unlock time, the app shows a pre-trip lobby with checked-in avatars, a countdown, and lobby comments. Points, cards, route levels, photos, votes, hype, and hot seat actions stay locked until trip day. Do not leave Realtime Database in test mode.
 
-This app is designed for a private trip link plus invited-player codes. After the unlock time, a player must choose an invited name and enter that name's private code. Firebase Anonymous Auth binds that browser/device to the claimed name, and database rules prevent one claimed player from writing another player's hand, votes, hype, or route-level progress.
+This app is designed for a private trip link plus invited-player codes. A player chooses an invited name and enters that name's private code. Firebase Anonymous Auth binds that browser/device to the claimed name, and database rules prevent one claimed player from writing another player's hand, votes, hype, or route-level progress.
 
 ## Invite setup
 
@@ -48,6 +48,7 @@ For multi-user local testing:
 - Use **Switch** to join manually as another player in the same tab.
 - Open per-player tabs with `?local=1&player=Alex`, for example `http://127.0.0.1:3000/?local=1&player=Blake`.
 - Add `reset=1` once to clear local test data before a run: `http://127.0.0.1:3000/?local=1&reset=1&player=Alex`.
+- Add `lobby=1` on localhost to preview the pre-trip lobby while still using local test data: `http://127.0.0.1:3000/?local=1&lobby=1`.
 
 Local mode serializes same-browser writes with the browser Web Locks API when available. The real 12-phone production test should still use Firebase Realtime Database, because that is the production sync layer.
 
@@ -58,4 +59,4 @@ Local mode serializes same-browser writes with the browser Web Locks API when av
 3. Add the `NEXT_PUBLIC_FIREBASE_*` environment variables from `.env.example`.
 4. Deploy.
 
-Players just open the Vercel URL on or after June 20, 2026, choose their invited name, and enter their private trip code. No email, OAuth, or visible account setup.
+Players can open the Vercel URL before June 20, 2026, choose their invited name, and enter their private trip code to check into the lobby. On June 20, the lobby unlocks into the full game. No email, OAuth, or visible account setup.
