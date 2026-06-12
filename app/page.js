@@ -276,6 +276,7 @@ export default function Page() {
     const TRIP_DEPART_AT = new Date("2026-06-20T07:00:00-07:00").getTime();
     const TRIP_WRAP_AT = new Date("2026-06-22T00:00:00-07:00").getTime();
     const TRIP_OPEN_LABEL = "June 20, 2026 at 12:00 AM PT";
+    const APP_BUILD = process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA || process.env.NEXT_PUBLIC_APP_VERSION || "";
     const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice", "join", "postLobbyComment", "copyDiagnostics"]);
 
     const app = document.getElementById("app");
@@ -773,6 +774,8 @@ export default function Page() {
       const codeInput = document.getElementById("inviteCodeInput");
       return {
         ts: new Date().toISOString(),
+        clientTs: Date.now(),
+        appBuild: APP_BUILD,
         eventUrl: location.href,
         mode: state.mode,
         localMode,
@@ -794,6 +797,30 @@ export default function Page() {
       };
     }
 
+    function remoteDiagnosticPayload(entry) {
+      const payload = clone(entry);
+      payload.source = "client";
+      payload.eventUrl = truncate(payload.eventUrl, 300);
+      payload.userAgent = truncate(payload.userAgent, 260);
+      if (payload.error) {
+        payload.error = {
+          code: truncate(payload.error.code || "", 120),
+          message: truncate(payload.error.message || "", 900),
+          stack: truncate(payload.error.stack || "", 1600)
+        };
+      }
+      return payload;
+    }
+
+    async function sendRemoteDiagnostic(entry) {
+      if (localMode || !firebaseApi || !db || !activeFirebaseUser()) return;
+      try {
+        await ref("clientErrors").push(remoteDiagnosticPayload(entry));
+      } catch (error) {
+        console.warn("Remote diagnostic did not sync", error);
+      }
+    }
+
     function recordDiagnostic(eventName, payload = {}) {
       const entry = {
         event: eventName,
@@ -807,6 +834,7 @@ export default function Page() {
       }
       state.hasDiagnostics = true;
       console.warn("[Oregon or Bust diagnostic]", entry);
+      sendRemoteDiagnostic(entry);
       return entry;
     }
 

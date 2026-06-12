@@ -63,6 +63,8 @@ Players can open the Vercel URL before June 20, 2026, choose their invited name,
 
 ## Production debugging
 
-The app keeps a small sanitized debug log in each browser. If a player hits an error, ask them to tap **Copy Debug Log** after the error appears and send you the copied text. The bundle includes Firebase error codes, app state, route, auth readiness, and recent client errors, but it does not include invite codes or Firebase secrets.
+The app keeps a small sanitized debug log in each browser and, after Firebase Anonymous Auth is available, writes captured client errors to Realtime Database at `clientErrors`. The remote error rows include Firebase error codes, app state, route, auth readiness, browser info, and recent client failure context, but they do not include invite codes or Firebase secrets.
 
-The normal fix workflow is: inspect the copied log, patch the repo, commit, push to GitHub, and let Vercel redeploy.
+If a player hits an error and there is no useful row under `clientErrors`, ask them to tap **Copy Debug Log** after the error appears and send you the copied text.
+
+The normal fix workflow is: inspect the Firebase `clientErrors` row or copied log, reproduce locally with `?local=1`, patch the repo, run `npm run build`, commit to `main`, push to GitHub, and let Vercel redeploy.

@@ -13,6 +13,15 @@
       ".write": false
     },
 
+    "clientErrors": {
+      ".read": false,
+      ".indexOn": ["clientTs"],
+      "$id": {
+        ".write": "auth != null && newData.exists()",
+        ".validate": "newData.hasChildren(['event', 'ts', 'clientTs']) && newData.child('event').isString() && newData.child('event').val().length > 0 && newData.child('event').val().length <= 80 && newData.child('ts').isString() && newData.child('ts').val().length > 0 && newData.child('ts').val().length <= 40 && newData.child('clientTs').isNumber()"
+      }
+    },
+
     "players": {
       "$uid": {
         ".read": "auth != null && auth.uid === $uid",
