@@ -316,6 +316,13 @@
       border-color: currentColor;
       box-shadow: none;
     }
+    .btn.debug-copy {
+      min-height: 42px;
+      border-style: dashed;
+      background: rgba(255,255,255,.36);
+      color: var(--pine);
+      font-size: 12px;
+    }
 
     .offline {
       position: sticky;

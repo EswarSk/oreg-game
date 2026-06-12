@@ -276,7 +276,7 @@ export default function Page() {
     const TRIP_DEPART_AT = new Date("2026-06-20T07:00:00-07:00").getTime();
     const TRIP_WRAP_AT = new Date("2026-06-22T00:00:00-07:00").getTime();
     const TRIP_OPEN_LABEL = "June 20, 2026 at 12:00 AM PT";
-    const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice", "join", "postLobbyComment"]);
+    const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice", "join", "postLobbyComment", "copyDiagnostics"]);
 
     const app = document.getElementById("app");
     const photoInput = document.getElementById("photoInput");
@@ -303,6 +303,8 @@ export default function Page() {
     const LOCAL_DB_KEY = "oob:local-db";
     const LOCAL_MODE_KEY = "oob:local-mode";
     const LOCAL_NAME_KEY = "oob:local-name";
+    const DEBUG_LOG_KEY = "oob:debug-log";
+    const DEBUG_LOG_LIMIT = 40;
     const LOCAL_LISTENERS = new Set();
     const LOCAL_TEST_NAMES = [
       "Alex", "Blake", "Casey", "Devon", "Emery", "Finley",
@@ -348,6 +350,7 @@ export default function Page() {
       rankDot: false,
       lastLeader: "",
       seenFullTank: false,
+      hasDiagnostics: hasStoredDiagnostics(),
       loaded: {
         roster: false, scores: false, hype: false, votes: false, feed: false,
         hotseat: false, hand: false, photos: false, history: false, claims: false, stopVotes: false, routeProgress: false, invites: false, lobby: false
@@ -729,6 +732,144 @@ export default function Page() {
       return wrapRef(firebaseApi.ref(db, path));
     }
 
+    function safeJsonParse(value, fallback) {
+      try {
+        return JSON.parse(value);
+      } catch {
+        return fallback;
+      }
+    }
+
+    function truncate(value, max = 900) {
+      const text = String(value ?? "");
+      return text.length > max ? `${text.slice(0, max)}...` : text;
+    }
+
+    function storedDiagnostics() {
+      try {
+        if (!window.localStorage) return [];
+        const rows = safeJsonParse(localStorage.getItem(DEBUG_LOG_KEY) || "[]", []);
+        return Array.isArray(rows) ? rows : [];
+      } catch {
+        return [];
+      }
+    }
+
+    function hasStoredDiagnostics() {
+      return storedDiagnostics().length > 0;
+    }
+
+    function serializeError(error) {
+      if (!error) return { message: "Unknown error" };
+      if (typeof error === "string") return { message: truncate(error) };
+      return {
+        code: error.code || error.name || "",
+        message: truncate(error.message || String(error)),
+        stack: truncate(error.stack || "", 1600)
+      };
+    }
+
+    function diagnosticSnapshot(extra = {}) {
+      const codeInput = document.getElementById("inviteCodeInput");
+      return {
+        ts: new Date().toISOString(),
+        eventUrl: location.href,
+        mode: state.mode,
+        localMode,
+        tripLocked: tripLocked(),
+        connected: state.connected,
+        authReady: state.authReady,
+        authUidTail: state.authUid ? state.authUid.slice(-8) : "",
+        name: state.name || "",
+        nameDraft: state.nameDraft || "",
+        invitedNameCount: state.invitedNames.length,
+        inviteCodeEntered: Boolean(state.inviteCodeDraft || codeInput?.value),
+        tab: state.tab,
+        loaded: { ...state.loaded },
+        rosterCount: state.roster.length,
+        lobbyMessageCount: state.lobbyMessages.length,
+        online: navigator.onLine,
+        userAgent: navigator.userAgent,
+        ...extra
+      };
+    }
+
+    function recordDiagnostic(eventName, payload = {}) {
+      const entry = {
+        event: eventName,
+        ...diagnosticSnapshot(payload)
+      };
+      const rows = [...storedDiagnostics(), entry].slice(-DEBUG_LOG_LIMIT);
+      try {
+        localStorage.setItem(DEBUG_LOG_KEY, JSON.stringify(rows));
+      } catch {
+        // Keep console diagnostics even when browser storage is unavailable.
+      }
+      state.hasDiagnostics = true;
+      console.warn("[Oregon or Bust diagnostic]", entry);
+      return entry;
+    }
+
+    function recordError(eventName, error, payload = {}) {
+      return recordDiagnostic(eventName, {
+        ...payload,
+        error: serializeError(error)
+      });
+    }
+
+    function diagnosticBundle() {
+      return {
+        app: "Oregon or Bust",
+        generatedAt: new Date().toISOString(),
+        current: diagnosticSnapshot(),
+        logs: storedDiagnostics()
+      };
+    }
+
+    function debugButtonHtml() {
+      if (!state.hasDiagnostics) return "";
+      return `<button class="btn ghost debug-copy" data-action="copyDiagnostics">COPY DEBUG LOG</button>`;
+    }
+
+    async function copyDiagnostics() {
+      const text = JSON.stringify(diagnosticBundle(), null, 2);
+      try {
+        await navigator.clipboard.writeText(text);
+        toast("Debug log copied. Send it to Eswar.");
+      } catch (error) {
+        try {
+          const textarea = document.createElement("textarea");
+          textarea.value = text;
+          textarea.setAttribute("readonly", "");
+          textarea.style.position = "fixed";
+          textarea.style.left = "-999px";
+          document.body.appendChild(textarea);
+          textarea.select();
+          document.execCommand("copy");
+          textarea.remove();
+          toast("Debug log copied. Send it to Eswar.");
+        } catch (copyError) {
+          recordError("diagnostics.copy_failed", copyError, { originalError: serializeError(error) });
+          toast("Could not copy debug log.");
+        }
+      }
+    }
+
+    function friendlyJoinError(error) {
+      const code = String(error?.code || "");
+      const message = String(error?.message || "");
+      if (code.includes("PERMISSION_DENIED") || /permission_denied|permission denied/i.test(message)) {
+        return "Firebase rejected join. Publish latest rules and verify invite data.";
+      }
+      if (/auth|unauth/i.test(`${code} ${message}`)) {
+        return "Auth did not start. Enable Anonymous sign-in in Firebase.";
+      }
+      if (/network|offline|unavailable/i.test(`${code} ${message}`)) {
+        return "Network issue. Reopen the app and try again.";
+      }
+      return "Join did not sync. Copy debug log and send it.";
+    }
+
     function toast(message) {
       const wrap = document.getElementById("toasts");
       const el = document.createElement("div");
@@ -858,6 +999,7 @@ export default function Page() {
         render();
         pruneLobbyMessages();
       } catch (error) {
+        recordError("lobby_comment.failed", error, { textLength: text.length });
         toast("Lobby comment did not post.");
         console.warn(error);
       }
@@ -908,6 +1050,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             <p class="muted">Create a free Firebase project, enable Realtime Database in test mode, then add these values in Vercel or a local .env.local file.</p>
             <button class="btn falls" data-action="startLocal">START LOCAL TEST MODE</button>
             <button class="btn sand" data-action="seedLocal">ADD 12 TEST PLAYERS</button>
+            ${debugButtonHtml()}
             <p class="muted mini" style="margin:0">Local test mode stores data in this browser and syncs across tabs on this machine. It is only for development.</p>
           </section>
         </main>`;
@@ -967,6 +1110,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
               <button class="btn" data-action="postLobbyComment">POST COMMENT</button>
             </section>
             <p class="muted mini" style="margin:0">You are checked in. Points, cards, photos, route levels, and hot seat stay locked until trip day.</p>
+            ${debugButtonHtml()}
           </section>
         </main>`;
     }
@@ -996,6 +1140,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
               <input id="inviteCodeInput" data-field="inviteCode" maxlength="32" autocomplete="one-time-code" placeholder="Private invite code" value="${escapeHtml(state.inviteCodeDraft)}">`}
               <button class="btn" data-action="join">${preTrip ? "JOIN LOBBY" : "LET'S RIDE +25"}</button>
             ` : `<div class="empty">Loading invite list...</div>`}
+            ${debugButtonHtml()}
           </section>
         </main>`;
     }
@@ -1026,6 +1171,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         <main class="screen stack">
           ${localMode ? `<div class="offline local-banner"><span>Local test mode${state.name ? ` - ${escapeHtml(state.name)}` : ""}</span><button data-action="seedLocal">Seed Demo</button><button data-action="switchLocal">Switch</button><button data-action="resetLocal">Reset</button></div>` : ""}
           ${state.connected ? "" : `<div class="offline">Reconnecting... your taps will sync when you're back</div>`}
+          ${debugButtonHtml()}
           ${content}
         </main>
         ${confirmDialogHtml()}
@@ -1846,8 +1992,14 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         }
         render();
       } catch (error) {
-        toast("Join did not sync. Try again.");
+        recordError("join.failed", error, {
+          selectedName: clean,
+          selectedNameInInviteList: allowed.includes(clean),
+          invitedNameCount: allowed.length
+        });
+        toast(friendlyJoinError(error));
         console.warn(error);
+        render();
       }
     }
 
@@ -2621,6 +2773,20 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       }, 1000);
     }
 
+    window.addEventListener("error", event => {
+      recordError("window.error", event.error || event.message, {
+        source: event.filename || "",
+        line: event.lineno || 0,
+        column: event.colno || 0
+      });
+      render();
+    });
+
+    window.addEventListener("unhandledrejection", event => {
+      recordError("window.unhandledrejection", event.reason);
+      render();
+    });
+
     document.addEventListener("click", event => {
       const tab = event.target.closest("[data-tab]");
         if (tab) {
@@ -2648,6 +2814,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       if (action === "resetLocal") resetLocalGame();
       if (action === "join") join();
       if (action === "postLobbyComment") postLobbyComment();
+      if (action === "copyDiagnostics") copyDiagnostics();
       if (action === "finishReveal") { state.revealCards = null; render(); }
       if (action === "confirmChoice") { resolveConfirm(actionEl.dataset.choice); return; }
       if (action === "pump") pump(actionEl);
@@ -2796,7 +2963,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           const profile = profileSnap.val();
           const profileName = sanitizeName(profile?.name);
           if (profileName) {
-            try { await ref(`playerNames/${profileName}`).set(state.authUid); } catch (claimError) { console.warn(claimError); }
+            try { await ref(`playerNames/${profileName}`).set(state.authUid); } catch (claimError) {
+              recordError("boot.profile_claim_failed", claimError, { profileName });
+              console.warn(claimError);
+            }
             activatePlayerSession(profileName);
             if (!tripLocked()) await ensureGameEntry(profileName);
           }
@@ -2804,8 +2974,9 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         startCountdown();
         render();
       } catch (error) {
+        recordError("boot.firebase_failed", error);
         console.warn(error);
-        app.innerHTML = `<main class="setup"><section class="setup-card"><h1 class="title">Firebase did not start</h1><p>Check the config block and Realtime Database URL.</p></section></main>`;
+        app.innerHTML = `<main class="setup"><section class="setup-card stack"><h1 class="title">Firebase did not start</h1><p>Check the config block, Anonymous Auth, and Realtime Database URL.</p>${debugButtonHtml()}</section></main>`;
       }
     }
 

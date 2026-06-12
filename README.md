@@ -60,3 +60,9 @@ Local mode serializes same-browser writes with the browser Web Locks API when av
 4. Deploy.
 
 Players can open the Vercel URL before June 20, 2026, choose their invited name, and enter their private trip code to check into the lobby. On June 20, the lobby unlocks into the full game. No email, OAuth, or visible account setup.
+
+## Production debugging
+
+The app keeps a small sanitized debug log in each browser. If a player hits an error, ask them to tap **Copy Debug Log** after the error appears and send you the copied text. The bundle includes Firebase error codes, app state, route, auth readiness, and recent client errors, but it does not include invite codes or Firebase secrets.
+
+The normal fix workflow is: inspect the copied log, patch the repo, commit, push to GitHub, and let Vercel redeploy.
