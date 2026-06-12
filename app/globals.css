@@ -27,7 +27,7 @@
       -webkit-font-smoothing: antialiased;
     }
 
-    button, input { font: inherit; }
+    button, input, select { font: inherit; }
     button {
       min-height: 44px;
       border: 0;
@@ -37,7 +37,7 @@
     }
     button:active { transform: scale(.94); }
     button:disabled { opacity: .58; cursor: not-allowed; transform: none; }
-    input {
+    input, select {
       width: 100%;
       min-height: 48px;
       border: 2px solid var(--pine);
@@ -49,7 +49,8 @@
       outline: none;
       box-shadow: 0 4px 0 rgba(12,33,27,.16);
     }
-    input:focus { border-color: var(--ember); }
+    select { appearance: none; }
+    input:focus, select:focus { border-color: var(--ember); }
     .field-label {
       margin-bottom: -4px;
       color: var(--pine);

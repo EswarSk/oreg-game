@@ -5,11 +5,31 @@ Mobile-only multiplayer road-trip game for the June 20-21, 2026 Seattle -> Orego
 ## Firebase setup
 
 1. Create a Firebase project at <https://console.firebase.google.com> on the free Spark plan.
-2. Build -> Realtime Database -> Create database -> test mode.
-3. Project settings -> General -> Your apps -> Web app -> copy the config values.
-4. Add those values to `.env.local` for local development, or to the same `NEXT_PUBLIC_FIREBASE_*` variables in Vercel.
+2. Build -> Realtime Database -> Create database. Use locked mode if Firebase asks.
+3. Build -> Authentication -> Sign-in method -> enable **Anonymous**.
+4. Project settings -> General -> Your apps -> Web app -> copy the config values.
+5. Add those values to `.env.local` for local development, or to the same `NEXT_PUBLIC_FIREBASE_*` variables in Vercel.
+6. In Realtime Database -> Rules, paste the contents of `database.rules.json` and publish them.
+7. Seed the invite list in Realtime Database before sharing the link.
 
-Realtime Database test mode means anyone with the link can write data, and the default test rules expire in 30 days. That is acceptable for a trusted weekend game, but do not store anything sensitive.
+The rules block all game writes until **June 20, 2026 at 12:00 AM Pacific** (`1781938800000` in Firebase server time). The app also shows a locked countdown screen before then. Do not leave Realtime Database in test mode.
+
+This app is designed for a private trip link plus invited-player codes. After the unlock time, a player must choose an invited name and enter that name's private code. Firebase Anonymous Auth binds that browser/device to the claimed name, and database rules prevent one claimed player from writing another player's hand, votes, hype, or route-level progress.
+
+## Invite setup
+
+Generate the Firebase seed JSON with one `Name=Code` pair per invited player:
+
+```bash
+npm run invites -- Alex=RIVER-482 Blake=FALLS-913 Casey=COAST-204
+```
+
+Paste the output into Realtime Database using the console's JSON import/merge flow. It creates:
+
+- `invitedNames/{Name}: true`, which is safe for the app to read.
+- `inviteCodes/{Name}/hash`, which rules can read but clients cannot.
+
+Give each person only their own code. If someone changes phones or clears browser data, they can reclaim their name by entering the same code; the newest claim becomes the active device for that name.
 
 ## Run locally
 
@@ -38,4 +58,4 @@ Local mode serializes same-browser writes with the browser Web Locks API when av
 3. Add the `NEXT_PUBLIC_FIREBASE_*` environment variables from `.env.example`.
 4. Deploy.
 
-Players just open the Vercel URL and type a display name. No accounts, email, OAuth, or verification.
+Players just open the Vercel URL on or after June 20, 2026, choose their invited name, and enter their private trip code. No email, OAuth, or visible account setup.

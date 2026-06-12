@@ -1,0 +1,141 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+
+    "invitedNames": {
+      ".read": true,
+      ".write": false
+    },
+
+    "inviteCodes": {
+      ".read": false,
+      ".write": false
+    },
+
+    "players": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid && now >= 1781938800000",
+        ".validate": "newData.hasChildren(['name', 'codeHash', 'joinedAt']) && newData.child('name').isString() && newData.child('name').val().length > 0 && newData.child('name').val().length <= 24 && root.child('invitedNames').child(newData.child('name').val()).val() === true && newData.child('codeHash').isString() && newData.child('codeHash').val() === root.child('inviteCodes').child(newData.child('name').val()).child('hash').val() && newData.child('joinedAt').isNumber()"
+      }
+    },
+
+    "playerNames": {
+      "$name": {
+        ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+        ".write": "auth != null && now >= 1781938800000 && root.child('players').child(auth.uid).child('name').val() === $name && newData.val() === auth.uid",
+        ".validate": "newData.isString()"
+      }
+    },
+
+    "roster": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "$name": {
+        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name",
+        ".validate": "newData.val() === true"
+      }
+    },
+
+    "scores": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "$name": {
+        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+        ".validate": "newData.isNumber() && newData.val() >= -500 && newData.val() <= 10000"
+      }
+    },
+
+    "hands": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "$name": {
+        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name"
+      }
+    },
+
+    "hype": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "count": {
+        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+        ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 5000"
+      },
+      "by": {
+        "$name": {
+          ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name",
+          ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 500"
+        }
+      }
+    },
+
+    "votes": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "$name": {
+        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name",
+        ".validate": "newData.isString()"
+      }
+    },
+
+    "stopVotes": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "$route": {
+        "$stop": {
+          "$name": {
+            ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name",
+            ".validate": "newData.isString()"
+          }
+        }
+      }
+    },
+
+    "routeProgress": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "$route": {
+        "players": {
+          "$name": {
+            ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name"
+          }
+        }
+      }
+    },
+
+    "feed": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      ".indexOn": ["ts"],
+      "$id": {
+        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && (!newData.exists() || newData.child('name').val() === root.child('players').child(auth.uid).child('name').val())"
+      }
+    },
+
+    "missionClaims": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "$mission": {
+        "$name": {
+          ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name"
+        }
+      }
+    },
+
+    "photos": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      ".indexOn": ["ts"],
+      "$photoId": {
+        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+        ".validate": "!newData.exists() || !newData.child('name').exists() || newData.child('name').val() === root.child('players').child(auth.uid).child('name').val() || data.child('name').exists()",
+        "reactions": {
+          "$emoji": {
+            "$name": {
+              ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name && (newData.val() === true || !newData.exists())"
+            }
+          }
+        }
+      }
+    },
+
+    "hotseat": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "history": {
+        ".indexOn": ["ts"]
+      }
+    }
+  }
+}

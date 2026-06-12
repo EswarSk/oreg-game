@@ -272,20 +272,31 @@ export default function Page() {
     ];
     const REACTIONS = ["🔥", "😂", "❤️", "🤯"];
     const AVATAR_COLORS = ["#16463A", "#2C6B52", "#2E8FA3", "#F2762E", "#B33A3A", "#735C2B", "#2E5B7D", "#7B3F58", "#35674C", "#1E4D59", "#8A4C25", "#5A6A36"];
+    const TRIP_OPEN_AT = new Date("2026-06-20T00:00:00-07:00").getTime();
+    const TRIP_DEPART_AT = new Date("2026-06-20T07:00:00-07:00").getTime();
+    const TRIP_WRAP_AT = new Date("2026-06-22T00:00:00-07:00").getTime();
+    const TRIP_OPEN_LABEL = "June 20, 2026 at 12:00 AM PT";
+    const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice"]);
 
     const app = document.getElementById("app");
     const photoInput = document.getElementById("photoInput");
     let db = null;
     let firebaseApi = null;
+    let authApi = null;
+    let authService = null;
     let localChannel = null;
     let localMode = false;
     let photosQuery = null;
     let historyQuery = null;
     let handRef = null;
+    let globalListenersAttached = false;
     let countdownTimer = null;
     let rankDotTimer = null;
     let repairingHandFor = "";
     let photoPromptTimer = null;
+    let feedBootstrapped = false;
+    const seenFeedIds = new Set();
+    let photosBootstrapped = false;
 
     const LOCAL_DB_KEY = "oob:local-db";
     const LOCAL_MODE_KEY = "oob:local-mode";
@@ -300,6 +311,10 @@ export default function Page() {
       mode: "boot",
       name: storedName(),
       nameDraft: "",
+      inviteCodeDraft: "",
+      invitedNames: [],
+      authReady: false,
+      authUid: "",
       tab: initialTab(),
       routeChoice: "A",
       selectedStopId: "",
@@ -324,17 +339,30 @@ export default function Page() {
       connected: true,
       spinning: false,
       spinningName: "",
+      activityDot: false,
+      photoDot: false,
       rankDot: false,
       lastLeader: "",
       seenFullTank: false,
       loaded: {
         roster: false, scores: false, hype: false, votes: false, feed: false,
-        hotseat: false, hand: false, photos: false, history: false, claims: false, stopVotes: false, routeProgress: false
+        hotseat: false, hand: false, photos: false, history: false, claims: false, stopVotes: false, routeProgress: false, invites: false
       }
     };
 
     function configMissing() {
       return Object.values(firebaseConfig).some(value => !value || String(value).includes("PASTE_HERE"));
+    }
+
+    function tripLocked() {
+      return !localMode && Date.now() < TRIP_OPEN_AT;
+    }
+
+    function ensureTripOpen() {
+      if (!tripLocked()) return true;
+      toast(`Oregon or Bust opens ${TRIP_OPEN_LABEL}.`);
+      render();
+      return false;
     }
 
     function escapeHtml(value) {
@@ -384,6 +412,14 @@ export default function Page() {
       return params.get("local") === "1" || params.get("test") === "1";
     }
 
+    function localHostAllowed() {
+      return ["localhost", "127.0.0.1", "::1"].includes(location.hostname);
+    }
+
+    function localBypassAllowed() {
+      return localRequested() && localHostAllowed();
+    }
+
     function localResetRequested() {
       return new URLSearchParams(location.search).get("reset") === "1";
     }
@@ -395,11 +431,29 @@ export default function Page() {
       history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
     }
 
+    function invitedNameOptions() {
+      return localMode ? LOCAL_TEST_NAMES : state.invitedNames;
+    }
+
+    function normalizeInviteCode(raw) {
+      return String(raw || "").trim().replace(/\s+/g, "").toUpperCase();
+    }
+
+    async function sha256Hex(value) {
+      const bytes = new TextEncoder().encode(value);
+      const hash = await crypto.subtle.digest("SHA-256", bytes);
+      return Array.from(new Uint8Array(hash)).map(byte => byte.toString(16).padStart(2, "0")).join("");
+    }
+
+    function activeFirebaseUser() {
+      return authService?.currentUser || null;
+    }
+
     function storedName() {
-      if (localStorage.getItem(LOCAL_MODE_KEY) === "1" || localRequested()) {
+      if (localHostAllowed() && (localStorage.getItem(LOCAL_MODE_KEY) === "1" || localRequested())) {
         return queryPlayerName() || sessionStorage.getItem(LOCAL_NAME_KEY) || "";
       }
-      return localStorage.getItem("oob:name") || "";
+      return "";
     }
 
     function storeName(name) {
@@ -592,6 +646,9 @@ export default function Page() {
       localMode = true;
       localStorage.setItem(LOCAL_MODE_KEY, "1");
       state.name = storedName();
+      state.invitedNames = LOCAL_TEST_NAMES;
+      state.loaded.invites = true;
+      if (!state.nameDraft) state.nameDraft = state.name || LOCAL_TEST_NAMES[0];
       localChannel = "BroadcastChannel" in window ? new BroadcastChannel("oob-local-db") : null;
       localChannel?.addEventListener("message", event => {
         if (event.data?.type === "change") localNotify();
@@ -613,12 +670,19 @@ export default function Page() {
 
     function wrapRef(baseRef, constraints = []) {
       const targetRef = constraints.length ? firebaseApi.query(baseRef, ...constraints) : baseRef;
+      let unsubscribe = null;
       return {
         on(eventName, callback) {
           if (eventName !== "value") throw new Error(`Unsupported Firebase event: ${eventName}`);
-          return firebaseApi.onValue(targetRef, callback);
+          unsubscribe = firebaseApi.onValue(targetRef, callback);
+          return unsubscribe;
         },
         off() {
+          if (unsubscribe) {
+            unsubscribe();
+            unsubscribe = null;
+            return;
+          }
           firebaseApi.off(targetRef);
         },
         once(eventName) {
@@ -718,6 +782,38 @@ export default function Page() {
       if (state.tab === "hotseat") ensureHistoryListener();
     }
 
+    function notifyRemoteFeedItems(items) {
+      if (!feedBootstrapped) {
+        items.forEach(item => { if (item?.id) seenFeedIds.add(item.id); });
+        feedBootstrapped = true;
+        return;
+      }
+      items
+        .filter(item => item?.id && !seenFeedIds.has(item.id))
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0))
+        .forEach(item => {
+          seenFeedIds.add(item.id);
+          if (item.name && item.name === state.name) return;
+          if (state.tab !== "home") state.activityDot = true;
+          toast(item.text || "New trip update.");
+          navigator.vibrate?.(45);
+        });
+    }
+
+    function photoLiveSignature(photo) {
+      const reactions = REACTIONS
+        .map(emoji => `${emoji}:${Object.keys(photo.reactions?.[emoji] || {}).sort().join(",")}`)
+        .join(";");
+      return `${photo.id}:${photo.ts || 0}:${reactions}`;
+    }
+
+    function photoWallChanged(previousPhotos, nextPhotos) {
+      if (!photosBootstrapped) return false;
+      const previous = new Map(previousPhotos.map(photo => [photo.id, photoLiveSignature(photo)]));
+      if (previous.size !== nextPhotos.length) return true;
+      return nextPhotos.some(photo => previous.get(photo.id) !== photoLiveSignature(photo));
+    }
+
     async function pushFeed(text, name = state.name) {
       try {
         await ref("feed").push({ ts: Date.now(), name, text });
@@ -775,12 +871,35 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function render() {
       if (state.mode === "setup") return setupScreen();
+      if (tripLocked()) return renderTripLock();
       if (state.revealCards) return renderReveal();
       if (!state.name) return renderJoin();
       renderApp();
     }
 
+    function renderTripLock() {
+      app.innerHTML = `
+        <main class="join">
+          <div class="logo" style="margin:auto">OREGON<span>OR BUST</span><small>Seattle -> Oregon</small></div>
+          <section class="join-card stack">
+            <div>
+              <h1 class="title">Trip Opens Soon</h1>
+              <p class="muted">Game actions unlock ${TRIP_OPEN_LABEL}.</p>
+            </div>
+            <p>The road-trip board is locked until trip day, so nobody can join, score points, play cards, upload photos, react, or complete levels early.</p>
+            <section class="panel sand" style="box-shadow:none">
+              <h2 class="section-title" data-countdown-title>Unlock Countdown</h2>
+              ${countdownHtml(TRIP_OPEN_AT)}
+            </section>
+          </section>
+        </main>`;
+    }
+
     function renderJoin() {
+      const names = invitedNameOptions();
+      const inviteReady = localMode || state.loaded.invites;
+      const selectedName = sanitizeName(state.nameDraft) || names[0] || "";
+      const nameOptions = names.map(name => `<option value="${escapeHtml(name)}" ${name === selectedName ? "selected" : ""}>${escapeHtml(name)}</option>`).join("");
       app.innerHTML = `
         <main class="join">
           <div class="logo" style="margin:auto">OREGON<span>OR BUST</span><small>Seattle -> Oregon</small></div>
@@ -789,9 +908,17 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
               <h1 class="title">Seattle -> Oregon</h1>
               <p class="muted">June 20-21, 2026</p>
             </div>
-            <p>Joining earns <strong>+25 pts</strong> and deals <strong>2 secret wild cards</strong>. Everything posted is visible to the whole crew.</p>
-            <input id="nameInput" maxlength="24" autocomplete="nickname" placeholder="Display name" value="${escapeHtml(state.nameDraft)}">
-            <button class="btn" data-action="join">LET'S RIDE +25</button>
+            <p>Pick your invited name and enter your trip code. Joining earns <strong>+25 pts</strong> and deals <strong>2 secret wild cards</strong>.</p>
+            ${inviteReady && !names.length ? `<div class="empty">The invite list is not loaded yet. Add invited names and code hashes in Firebase before sharing the link.</div>` : ""}
+            ${inviteReady && names.length ? `
+              <label class="field-label" for="nameInput">Invited player</label>
+              <select id="nameInput" data-field="name">
+                ${nameOptions}
+              </select>
+              ${localMode ? "" : `<label class="field-label" for="inviteCodeInput">Trip code</label>
+              <input id="inviteCodeInput" data-field="inviteCode" maxlength="32" autocomplete="one-time-code" placeholder="Private invite code" value="${escapeHtml(state.inviteCodeDraft)}">`}
+              <button class="btn" data-action="join">LET'S RIDE +25</button>
+            ` : `<div class="empty">Loading invite list...</div>`}
           </section>
         </main>`;
     }
@@ -919,16 +1046,13 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function countdownTitle() {
       const now = Date.now();
-      const depart = new Date("2026-06-20T07:00:00-07:00").getTime();
-      const post = new Date("2026-06-22T00:00:00-07:00").getTime();
-      if (now >= post) return "THAT WAS LEGENDARY 🌲";
-      if (now >= depart) return "WE'RE ON THE ROAD 🎉";
+      if (now >= TRIP_WRAP_AT) return "THAT WAS LEGENDARY 🌲";
+      if (now >= TRIP_DEPART_AT) return "WE'RE ON THE ROAD 🎉";
       return "Countdown To Roll-Out";
     }
 
-    function countdownHtml() {
-      const depart = new Date("2026-06-20T07:00:00-07:00").getTime();
-      let seconds = Math.max(0, Math.floor((depart - Date.now()) / 1000));
+    function countdownHtml(target = TRIP_DEPART_AT) {
+      let seconds = Math.max(0, Math.floor((target - Date.now()) / 1000));
       const days = Math.floor(seconds / 86400); seconds -= days * 86400;
       const hours = Math.floor(seconds / 3600); seconds -= hours * 3600;
       const minutes = Math.floor(seconds / 60); seconds -= minutes * 60;
@@ -966,7 +1090,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           <div class="map-meta">
             <div>
               <p>Seattle to Oregon</p>
-              <h1>Route Levels</h1>
+              <h1>Your Levels</h1>
             </div>
             <span class="route-pill">${progress.completedCount}/${progress.total}</span>
           </div>
@@ -1048,8 +1172,31 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       return STOP_ICONS.default;
     }
 
+    function routeProgressRoot(choice = ROUTE_KEY) {
+      return state.routeProgress?.[choice || ROUTE_KEY] || {};
+    }
+
+    function playerRouteProgress(choice = ROUTE_KEY, name = state.name) {
+      if (!name) return {};
+      return routeProgressRoot(choice)?.players?.[name] || {};
+    }
+
+    function setPlayerRouteProgress(choice, name, progress) {
+      const route = routeProgressRoot(choice);
+      state.routeProgress = {
+        ...state.routeProgress,
+        [choice]: {
+          ...route,
+          players: {
+            ...(route.players || {}),
+            [name]: progress || {}
+          }
+        }
+      };
+    }
+
     function completedLevels(choice) {
-      return state.routeProgress?.[choice || ROUTE_KEY]?.completed || {};
+      return playerRouteProgress(choice).completed || {};
     }
 
     function completedLevelData(choice, stopId) {
@@ -1057,7 +1204,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     function levelTaskData(stopId) {
-      return state.routeProgress?.[ROUTE_KEY]?.tasks?.[stopId] || {};
+      return playerRouteProgress(ROUTE_KEY).tasks?.[stopId] || {};
     }
 
     function levelTasksDone(stop) {
@@ -1101,7 +1248,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function levelProgressLabel(progress) {
       if (!progress.total) return "No levels loaded";
-      if (progress.allDone) return `All ${progress.total} levels cleared`;
+      if (progress.allDone) return `All ${progress.total} of your levels cleared`;
       return `Level ${progress.currentIndex + 1} of ${progress.total}: ${progress.currentStop?.name || "Next stop"}`;
     }
 
@@ -1109,7 +1256,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const pct = progress.total ? Math.round(progress.completedCount / progress.total * 100) : 0;
       return `<div class="level-progress">
         <div class="between">
-          <strong>${progress.completedCount}/${progress.total} levels complete</strong>
+          <strong>${progress.completedCount}/${progress.total} personal levels complete</strong>
           <span class="mono mini">${pct}%</span>
         </div>
         <div class="level-bar"><span style="width:${pct}%"></span></div>
@@ -1215,7 +1362,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           </div>
         </div>
         <p class="stop-signal">${escapeHtml(stop.note)}</p>
-        ${completed ? `<p class="stop-signal">Cleared by <strong>${escapeHtml(completed.by || "the crew")}</strong>${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.</p>` : ""}
+        ${completed ? `<p class="stop-signal">Cleared by <strong>you</strong>${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.</p>` : ""}
         <div class="level-checklist">
           ${(stop.tasks || []).map(task => levelTaskHtml(stop, task, status, completed)).join("")}
         </div>
@@ -1231,7 +1378,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         <span class="task-box">${done ? "✓" : ""}</span>
         <span>
           <strong>${escapeHtml(task.label)}</strong>
-          <em>${done ? `done by ${escapeHtml(done.by || "crew")}` : "tap when done"}</em>
+          <em>${done ? `done by ${done.by === state.name ? "you" : escapeHtml(done.by || "you")}` : "tap when done"}</em>
         </span>
       </button>`;
     }
@@ -1333,7 +1480,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           </div>
           ${action}
         </div>
-        <p>${completed ? `Cleared by ${escapeHtml(completed.by || "the crew")}${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.` : status === "current" ? "Active stop. Clear it to unlock the next level." : "Peek ahead and vote, but the route unlocks in order."}</p>
+        <p>${completed ? `Cleared by you${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.` : status === "current" ? "Your active stop. Clear it to unlock your next level." : "Peek ahead and vote, but your route unlocks in order."}</p>
         <div class="tray-signal">
           <span>${winner ? `${winner.emoji} ${escapeHtml(winner.label)}` : "Crew signal open"}</span>
           <span class="mono">${total} vote${total === 1 ? "" : "s"}</span>
@@ -1387,7 +1534,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           </div>
           <span class="stop-badge ${status}">${status === "complete" ? "✓" : status === "locked" ? "🔒" : stop.level}</span>
         </div>
-        <p class="stop-signal">${completed ? `Cleared by <strong>${escapeHtml(completed.by || "the crew")}</strong>${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.` : status === "current" ? "Active level. Clear this stop to unlock the next place." : "Plan ahead here, but complete the itinerary in order."}</p>
+        <p class="stop-signal">${completed ? `Cleared by <strong>you</strong>${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.` : status === "current" ? "Your active level. Clear this stop to unlock your next place." : "Plan ahead here, but complete your itinerary in order."}</p>
         ${action}
         <p class="stop-signal">${winner ? `${winner.emoji} Crew signal: <strong>${escapeHtml(winner.label)}</strong>` : "First read is wide open."}</p>
         <div class="vibe-grid">
@@ -1570,30 +1717,60 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       return `<nav class="tabbar ${locked ? "modal-locked" : ""}" aria-label="Main tabs">
         ${TABS.map(([key, icon, label]) => {
           const active = state.tab === key;
+          const hasBadge = (key === "home" && state.activityDot) || (key === "missions" && state.photoDot) || (key === "hotseat" && openDare) || (key === "ranks" && state.rankDot);
           return `<button class="tab ${active ? "active" : ""}" data-tab="${key}" aria-current="${active ? "page" : "false"}" aria-pressed="${active ? "true" : "false"}" ${locked ? `disabled aria-disabled="true"` : ""}>
           <span class="ico">${icon}</span><span>${label}</span>
-          ${(key === "hotseat" && openDare) || (key === "ranks" && state.rankDot) ? `<i class="badge-dot"></i>` : ""}
+          ${hasBadge ? `<i class="badge-dot"></i>` : ""}
         </button>`;
         }).join("")}
       </nav>`;
     }
 
+    function activatePlayerSession(name) {
+      const clean = sanitizeName(name);
+      if (!clean) return;
+      storeName(clean);
+      state.name = clean;
+      state.nameDraft = clean;
+      attachGlobalListeners();
+      attachPlayerListeners();
+      prepareActiveTab();
+    }
+
     async function join() {
+      if (!ensureTripOpen()) return;
       const clean = sanitizeName(state.nameDraft || document.getElementById("nameInput")?.value);
-      if (!clean) return toast("Type a name first.");
+      const allowed = invitedNameOptions();
+      if (!clean) return toast("Pick your invited name first.");
+      if (!allowed.includes(clean)) return toast("That name is not on the invite list.");
+      const code = normalizeInviteCode(state.inviteCodeDraft || document.getElementById("inviteCodeInput")?.value);
+      if (!localMode && !code) return toast("Enter your private trip code.");
       try {
+        if (!localMode) {
+          const user = activeFirebaseUser();
+          if (!user) return toast("Auth is still starting. Try again.");
+          const codeHash = await sha256Hex(code);
+          await ref(`players/${user.uid}`).set({
+            name: clean,
+            codeHash,
+            joinedAt: Date.now()
+          });
+          await ref(`playerNames/${clean}`).set(user.uid);
+        }
         const result = await ref(`roster/${clean}`).transaction(current => current === true ? undefined : true);
-        storeName(clean);
-        state.name = clean;
-        attachPlayerListeners();
+        let revealCards = null;
         if (result.committed) {
-          const cards = dealCards();
-          await ref(`hands/${clean}`).set(cards);
-          await addScore(clean, 25, document.querySelector("[data-action='join']"));
-          await pushFeed(`🚗 ${clean} hopped in the car (+25)`, clean);
-          state.revealCards = cards;
+          revealCards = dealCards();
+          await ref(`hands/${clean}`).set(revealCards);
         } else {
           await ensurePlayerHand(clean);
+        }
+        activatePlayerSession(clean);
+        if (result.committed) {
+          await addScore(clean, 25, document.querySelector("[data-action='join']"));
+          await pushFeed(`🚗 ${clean} hopped in the car (+25)`, clean);
+          state.revealCards = revealCards;
+        } else {
           state.revealCards = null;
         }
         render();
@@ -1622,6 +1799,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     async function repairHand() {
       if (!state.name) return;
+      if (!ensureTripOpen()) return;
       try {
         const cards = await ensurePlayerHand(state.name);
         toast(cards ? "Fresh cards dealt." : "Cards are already dealt.");
@@ -1648,6 +1826,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function pump(target) {
+      if (!ensureTripOpen()) return;
       try {
         await ref("hype/count").transaction(value => (Number(value) || 0) + 1);
         const result = await ref(`hype/by/${state.name}`).transaction(value => (Number(value) || 0) + 1);
@@ -1660,6 +1839,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function vote(choice, target) {
+      if (!ensureTripOpen()) return;
       const previous = state.votes[state.name];
       state.routeChoice = choice;
       state.votes = { ...state.votes, [state.name]: choice };
@@ -1683,8 +1863,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function stopVote(stopId, vibe, target) {
+      if (!ensureTripOpen()) return;
       if (!stopId || !STOP_VIBES.some(item => item.id === vibe)) return;
       const route = ROUTE_KEY;
+      const stopName = routeStops().find(item => item.id === stopId)?.name || "a route stop";
       const previous = state.stopVotes?.[route]?.[stopId]?.[state.name];
       state.selectedStopId = stopId;
       state.stopVotes = {
@@ -1702,6 +1884,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         await ref(`stopVotes/${route}/${stopId}/${state.name}`).set(vibe);
         const vibeLabel = STOP_VIBES.find(item => item.id === vibe)?.label || "vote";
         toast(`${vibeLabel} marked.`);
+        if (previous !== vibe) await pushFeed(`🗺️ ${state.name} marked ${stopName}: ${vibeLabel}`);
         target?.classList.add("active");
       } catch (error) {
         const routeVotes = { ...(state.stopVotes?.[route] || {}) };
@@ -1716,13 +1899,15 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function toggleLevelTask(stopId, taskId) {
+      if (!ensureTripOpen()) return;
+      if (!state.name) return toast("Join the crew first.");
       const stops = routeStops();
       const stop = stops.find(item => item.id === stopId);
       const task = stop?.tasks?.find(item => item.id === taskId);
       if (!stop || !task) return;
       let checked = false;
       try {
-        const result = await ref(`routeProgress/${ROUTE_KEY}`).transaction(current => {
+        const result = await ref(`routeProgress/${ROUTE_KEY}/players/${state.name}`).transaction(current => {
           current = current || {};
           const completed = current.completed || {};
           if (completed[stop.id]) return;
@@ -1749,10 +1934,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         });
         if (!result.committed) return toast("That checklist is locked right now.");
         state.selectedStopId = stopId;
-        state.routeProgress = {
-          ...state.routeProgress,
-          [ROUTE_KEY]: result.snapshot.val() || {}
-        };
+        setPlayerRouteProgress(ROUTE_KEY, state.name, result.snapshot.val() || {});
         render();
         toast(checked ? "Checklist item cleared." : "Checklist item reopened.");
       } catch (error) {
@@ -1763,12 +1945,14 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function completeLevel(stopId, target) {
+      if (!ensureTripOpen()) return;
+      if (!state.name) return toast("Join the crew first.");
       const route = ROUTE_KEY;
       const stops = routeStops();
       const progress = routeLevelProgress(route, stops);
       const stop = stops.find(item => item.id === stopId);
       if (!stop) return;
-      if (progress.allDone) return toast("All route levels are already complete.");
+      if (progress.allDone) return toast("All your route levels are already complete.");
       if (progress.currentStop?.id !== stop.id) {
         return toast(`Level ${progress.currentIndex + 1} is up next.`);
       }
@@ -1780,7 +1964,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const nextStop = stops[stop.level] || stop;
 
       try {
-        const result = await ref(`routeProgress/${route}`).transaction(current => {
+        const result = await ref(`routeProgress/${route}/players/${state.name}`).transaction(current => {
           current = current || {};
           const completed = current.completed || {};
           if (completed[stop.id]) return;
@@ -1797,22 +1981,19 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           };
         });
         if (!result.committed) {
-          toast("Level state changed. Check the current level and tasks.");
+          toast("Your level state changed. Check the current level and tasks.");
           return;
         }
-        state.routeProgress = {
-          ...state.routeProgress,
-          [route]: result.snapshot.val() || {}
-        };
+        setPlayerRouteProgress(route, state.name, result.snapshot.val() || {});
         state.selectedStopId = nextStop.id;
         render();
         await addScore(state.name, 15, target);
-        await pushFeed(`🏁 Level ${stop.level} cleared: ${stop.name} (+15)`, state.name);
+        await pushFeed(`🏁 ${state.name} cleared Level ${stop.level}: ${stop.name} (+15)`, state.name);
         if (stop.level >= stops.length) {
-          toast("All route levels cleared!");
+          toast("All your route levels cleared!");
           burstConfetti();
         } else {
-          toast(`Level ${nextStop.level} unlocked.`);
+          toast(`Your Level ${nextStop.level} unlocked.`);
         }
         target?.classList.add("active");
       } catch (error) {
@@ -1824,6 +2005,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function reopenLevel(stopId) {
+      if (!ensureTripOpen()) return;
+      if (!state.name) return toast("Join the crew first.");
       const route = ROUTE_KEY;
       const stops = routeStops();
       const stop = stops.find(item => item.id === stopId);
@@ -1833,10 +2016,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         .filter(item => item.level >= stop.level && completed[item.id])
         .map(item => item.id);
       if (!idsToRemove.length) return;
-      if (!await askConfirm(`Reopen Level ${stop.level} and reset later completed levels?`, "Reopen", "Reopen level?")) return;
+      if (!await askConfirm(`Reopen your Level ${stop.level} and reset your later completed levels?`, "Reopen", "Reopen your level?")) return;
 
       try {
-        const result = await ref(`routeProgress/${route}`).transaction(current => {
+        const result = await ref(`routeProgress/${route}/players/${state.name}`).transaction(current => {
           current = current || {};
           const nextCompleted = { ...(current.completed || {}) };
           const nextTasks = { ...(current.tasks || {}) };
@@ -1853,14 +2036,11 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           };
         });
         if (!result.committed) return toast("Level reset did not sync.");
-        state.routeProgress = {
-          ...state.routeProgress,
-          [route]: result.snapshot.val() || {}
-        };
+        setPlayerRouteProgress(route, state.name, result.snapshot.val() || {});
         state.selectedStopId = stop.id;
         render();
-        await pushFeed(`↩️ ${state.name} reopened Level ${stop.level}: ${stop.name}`);
-        toast(`Level ${stop.level} is active again.`);
+        await pushFeed(`↩️ ${state.name} reopened their Level ${stop.level}: ${stop.name}`);
+        toast(`Your Level ${stop.level} is active again.`);
       } catch (error) {
         toast("Level reset did not sync.");
         render();
@@ -1869,6 +2049,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function playCard(index, target) {
+      if (!ensureTripOpen()) return;
       const card = state.hand[index];
       if (!card || card.used) return;
       if (!await askConfirm(`Play ${card.name} now? The whole crew will see it.`, "Play card", "Play wild card?")) return;
@@ -1895,6 +2076,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function spin(target) {
+      if (!ensureTripOpen()) return;
       const eligible = state.roster.filter(name => name !== state.name);
       if (!eligible.length) return toast("No one else has joined yet - share the link first!");
       if (state.hotseat && state.hotseat.status === "open") return toast("Someone's already in the hot seat - let them finish!");
@@ -1933,6 +2115,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function resolveDare(status, target) {
+      if (!ensureTripOpen()) return;
       const dare = state.hotseat;
       if (!dare || dare.target !== state.name) return;
       const history = { ...dare, status, resolvedAt: Date.now() };
@@ -1962,6 +2145,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function expireDare() {
+      if (!ensureTripOpen()) return;
       const dare = state.hotseat;
       if (!dare || Date.now() - Number(dare.ts || 0) <= 30 * 60 * 1000) return;
       const history = { ...dare, status: "expired", resolvedAt: Date.now() };
@@ -1995,6 +2179,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     function pickMission(missionId) {
+      if (!ensureTripOpen()) return;
       const mission = MISSIONS.find(item => item.id === missionId);
       if (!mission) return;
       state.pendingMissionId = missionId;
@@ -2008,6 +2193,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function handlePhotoFile(file) {
+      if (!ensureTripOpen()) return;
       const mission = MISSIONS.find(item => item.id === state.pendingMissionId);
       clearTimeout(photoPromptTimer);
       if (!mission) return;
@@ -2107,12 +2293,15 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function react(photoId, emoji, target) {
+      if (!ensureTripOpen()) return;
       const photo = state.photos.find(item => item.id === photoId);
+      if (!state.name) return toast("Join the crew first.");
       if (!photo || !REACTIONS.includes(emoji)) return;
       const prior = JSON.parse(JSON.stringify(photo.reactions || {}));
       state.photos = state.photos.map(item => {
         if (item.id !== photoId) return item;
         const next = JSON.parse(JSON.stringify(item));
+        next.reactions = next.reactions || {};
         REACTIONS.forEach(e => {
           next.reactions[e] = next.reactions[e] || {};
           delete next.reactions[e][state.name];
@@ -2122,21 +2311,18 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         return next;
       });
       render();
-      let firstReaction = false;
+      const firstReaction = !REACTIONS.some(e => prior?.[e]?.[state.name]);
       try {
-        const result = await ref(`photos/${photoId}/reactions`).transaction(reactions => {
-          reactions = reactions || {};
-          firstReaction = !REACTIONS.some(e => reactions?.[e]?.[state.name]);
-          REACTIONS.forEach(e => {
-            reactions[e] = reactions[e] || {};
-            delete reactions[e][state.name];
-          });
-          reactions[emoji][state.name] = true;
-          return reactions;
-        });
-        if (result.committed && firstReaction && photo.name !== state.name) {
+        await Promise.all(REACTIONS
+          .filter(e => e !== emoji && prior?.[e]?.[state.name])
+          .map(e => ref(`photos/${photoId}/reactions/${e}/${state.name}`).remove()));
+        await ref(`photos/${photoId}/reactions/${emoji}/${state.name}`).set(true);
+        if (firstReaction && photo.name !== state.name) {
           await addScore(state.name, 2, target);
           await addScore(photo.name, 3);
+        }
+        if (firstReaction) {
+          await pushFeed(`${state.name} reacted ${emoji} to ${photo.name || "someone"}'s photo`, state.name);
         }
       } catch (error) {
         state.photos = state.photos.map(item => item.id === photoId ? { ...item, reactions: prior } : item);
@@ -2147,6 +2333,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     function attachGlobalListeners() {
+      if (globalListenersAttached) return;
+      globalListenersAttached = true;
       ref(".info/connected").on("value", snap => {
         state.connected = snap.val() !== false;
         render();
@@ -2198,6 +2386,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         const rows = [];
         snap.forEach(child => rows.push({ id: child.key, ...child.val() }));
         state.feed = rows.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+        notifyRemoteFeedItems(state.feed);
         state.loaded.feed = true;
         render();
       });
@@ -2214,6 +2403,20 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       ref("missionClaims").on("value", snap => {
         state.missionClaims = snap.val() || {};
         state.loaded.claims = true;
+        render();
+      });
+      ensurePhotosListener();
+    }
+
+    function attachInviteListener() {
+      ref("invitedNames").on("value", snap => {
+        const rows = [];
+        snap.forEach(child => {
+          if (child.val()) rows.push(sanitizeName(child.key));
+        });
+        state.invitedNames = rows.filter(Boolean).sort((a, b) => a.localeCompare(b));
+        if (!state.nameDraft && state.invitedNames.length) state.nameDraft = state.invitedNames[0];
+        state.loaded.invites = true;
         render();
       });
     }
@@ -2241,14 +2444,18 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       });
     }
 
-    function ensurePhotosListener() {
+    function ensurePhotosListener(force = false) {
+      if (photosQuery && !force) return;
       if (photosQuery) photosQuery.off();
       state.loaded.photos = false;
       photosQuery = ref("photos").orderByChild("ts").limitToLast(state.photoLimit);
       photosQuery.on("value", snap => {
         const rows = [];
         snap.forEach(child => rows.push({ id: child.key, ...child.val() }));
-        state.photos = rows.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+        const nextPhotos = rows.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+        if (state.tab !== "missions" && photoWallChanged(state.photos, nextPhotos)) state.photoDot = true;
+        state.photos = nextPhotos;
+        photosBootstrapped = true;
         state.loaded.photos = true;
         render();
       });
@@ -2269,6 +2476,15 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     function startCountdown() {
       clearInterval(countdownTimer);
       countdownTimer = setInterval(() => {
+        if (!tripLocked() && document.querySelector(".join-card [data-countdown]")) {
+          render();
+          return;
+        }
+        if (tripLocked()) {
+          const countdown = document.querySelector("[data-countdown]");
+          if (countdown) countdown.outerHTML = countdownHtml(TRIP_OPEN_AT);
+          return;
+        }
         if (!state.name || state.tab !== "home") return;
         const title = document.querySelector("[data-countdown-title]");
         const countdown = document.querySelector("[data-countdown]");
@@ -2283,6 +2499,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         if (tab) {
         if (state.confirmDialog) return;
         state.tab = tab.dataset.tab;
+        if (state.tab === "home") state.activityDot = false;
+        if (state.tab === "missions") state.photoDot = false;
         updateTabParam(state.tab);
         prepareActiveTab();
         render();
@@ -2293,6 +2511,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       if (!actionEl) return;
       const action = actionEl.dataset.action;
       if (state.confirmDialog && action !== "confirmChoice") return;
+      if (tripLocked() && !PRE_TRIP_ALLOWED_ACTIONS.has(action)) {
+        ensureTripOpen();
+        return;
+      }
       if (action === "startLocal") startLocalMode();
       if (action === "seedLocal") seedLocalCrew();
       if (action === "switchLocal") switchLocalPlayer();
@@ -2315,12 +2537,18 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       if (action === "repairHand") repairHand();
       if (action === "mission") pickMission(actionEl.dataset.mission);
       if (action === "react") react(actionEl.dataset.photo, actionEl.dataset.emoji, actionEl);
-      if (action === "loadPhotos") { state.photoLimit += 20; ensurePhotosListener(); render(); }
+      if (action === "loadPhotos") { state.photoLimit += 20; ensurePhotosListener(true); render(); }
     });
 
     document.addEventListener("input", event => {
       if (event.target.id === "nameInput") state.nameDraft = event.target.value;
+      if (event.target.id === "inviteCodeInput") state.inviteCodeDraft = event.target.value;
       if (event.target.dataset.field === "caption") state.caption = event.target.value;
+    });
+
+    document.addEventListener("change", event => {
+      if (event.target.id === "nameInput") state.nameDraft = event.target.value;
+      if (event.target.id === "inviteCodeInput") state.inviteCodeDraft = event.target.value;
     });
 
     document.addEventListener("keydown", event => {
@@ -2389,6 +2617,16 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function boot() {
+      if (localBypassAllowed()) {
+        if (localResetRequested()) {
+          localStorage.removeItem(LOCAL_DB_KEY);
+          sessionStorage.removeItem(LOCAL_NAME_KEY);
+          localStorage.setItem(LOCAL_MODE_KEY, "1");
+          clearLocalResetParam();
+        }
+        startLocalMode();
+        return;
+      }
       if (configMissing()) {
         if (localResetRequested()) {
           localStorage.removeItem(LOCAL_DB_KEY);
@@ -2405,19 +2643,33 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         return;
       }
       try {
-        const [appModule, databaseModule] = await Promise.all([
+        const [appModule, databaseModule, authModule] = await Promise.all([
           import("@firebase/app"),
-          import("@firebase/database")
+          import("@firebase/database"),
+          import("@firebase/auth")
         ]);
         firebaseApi = databaseModule;
+        authApi = authModule;
         const { getApps, initializeApp } = appModule;
         const { getDatabase } = databaseModule;
+        const { getAuth, signInAnonymously } = authModule;
         const appInstance = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
         db = getDatabase(appInstance);
+        authService = getAuth(appInstance);
+        if (!authService.currentUser) await signInAnonymously(authService);
+        state.authUid = authService.currentUser?.uid || "";
+        state.authReady = Boolean(state.authUid);
         state.mode = "app";
-        attachGlobalListeners();
-        if (state.name) attachPlayerListeners();
-        prepareActiveTab();
+        attachInviteListener();
+        if (state.authUid && !tripLocked()) {
+          const profileSnap = await ref(`players/${state.authUid}`).once("value");
+          const profile = profileSnap.val();
+          const profileName = sanitizeName(profile?.name);
+          if (profileName) {
+            try { await ref(`playerNames/${profileName}`).set(state.authUid); } catch (claimError) { console.warn(claimError); }
+            activatePlayerSession(profileName);
+          }
+        }
         startCountdown();
         render();
       } catch (error) {
