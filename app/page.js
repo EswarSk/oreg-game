@@ -1141,7 +1141,21 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         </main>`;
     }
 
+    function bootScreen(message = "Starting the trip lobby...") {
+      app.innerHTML = `
+        <main class="setup">
+          <div class="logo" style="margin:auto">OREGON<span>OR BUST</span><small>Seattle -> Oregon</small></div>
+          <section class="setup-card stack">
+            <h1 class="title">Loading Oregon or Bust</h1>
+            <p>${escapeHtml(message)}</p>
+            <p class="muted mini" style="margin:0">If this stays here, refresh once. If it still does not open, copy the debug log and send it to Eswar.</p>
+            ${debugButtonHtml()}
+          </section>
+        </main>`;
+    }
+
     function render() {
+      if (state.mode === "boot") return bootScreen();
       if (state.mode === "setup") return setupScreen();
       if (!state.name) return renderJoin();
       if (tripLocked()) return renderLobby();
@@ -3055,6 +3069,12 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function boot() {
+      bootScreen();
+      const bootTimeout = setTimeout(() => {
+        if (state.mode !== "boot") return;
+        recordDiagnostic("boot.timeout", { firebaseConfigured: !configMissing() });
+        bootScreen("Still connecting to the trip lobby. This is usually a slow network, blocked script, or Firebase startup issue.");
+      }, 8000);
       if (localBypassAllowed()) {
         if (localResetRequested()) {
           localStorage.removeItem(LOCAL_DB_KEY);
@@ -3063,6 +3083,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           clearLocalResetParam();
         }
         startLocalMode();
+        clearTimeout(bootTimeout);
         return;
       }
       if (configMissing()) {
@@ -3078,6 +3099,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           state.mode = "setup";
           render();
         }
+        clearTimeout(bootTimeout);
         return;
       }
       try {
@@ -3118,6 +3140,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         recordError("boot.firebase_failed", error);
         console.warn(error);
         app.innerHTML = `<main class="setup"><section class="setup-card stack"><h1 class="title">Firebase did not start</h1><p>Check the config block, Anonymous Auth, and Realtime Database URL.</p>${debugButtonHtml()}</section></main>`;
+      } finally {
+        clearTimeout(bootTimeout);
       }
     }
 
@@ -3127,7 +3151,17 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
   return (
     <>
-      <div id="app" className="phone" />
+      <div id="app" className="phone">
+        <main className="setup">
+          <div className="logo" style={{ margin: "auto" }}>
+            OREGON<span>OR BUST</span><small>Seattle -&gt; Oregon</small>
+          </div>
+          <section className="setup-card stack">
+            <h1 className="title">Loading Oregon or Bust</h1>
+            <p>Starting the trip lobby...</p>
+          </section>
+        </main>
+      </div>
       <div id="toasts" className="toast-wrap" aria-live="polite" />
       <input id="photoInput" type="file" accept="image/*" capture="environment" hidden />
     </>
