@@ -501,6 +501,36 @@ export default function Page() {
       return authService?.currentUser || null;
     }
 
+    function waitForAuthUser(auth, timeoutMs = 5000) {
+      return new Promise(resolve => {
+        let settled = false;
+        let timer = null;
+        let unsubscribe = null;
+        const finish = user => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          if (unsubscribe) unsubscribe();
+          resolve(user || auth.currentUser || null);
+        };
+        timer = setTimeout(() => finish(auth.currentUser || null), timeoutMs);
+        try {
+          unsubscribe = authApi.onAuthStateChanged(
+            auth,
+            user => finish(user),
+            error => {
+              console.warn(error);
+              finish(auth.currentUser || null);
+            }
+          );
+          if (settled && unsubscribe) unsubscribe();
+        } catch (error) {
+          console.warn(error);
+          finish(auth.currentUser || null);
+        }
+      });
+    }
+
     function storedName() {
       if (localHostAllowed() && (localStorage.getItem(LOCAL_MODE_KEY) === "1" || localRequested())) {
         return queryPlayerName() || sessionStorage.getItem(LOCAL_NAME_KEY) || "";
@@ -1152,6 +1182,35 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             ${debugButtonHtml()}
           </section>
         </main>`;
+    }
+
+    function failureScreen(title, message) {
+      app.innerHTML = `
+        <main class="setup">
+          <div class="logo" style="margin:auto">OREGON<span>OR BUST</span><small>Seattle -> Oregon</small></div>
+          <section class="setup-card stack">
+            <h1 class="title">${escapeHtml(title)}</h1>
+            <p>${escapeHtml(message)}</p>
+            <button class="btn falls" onclick="location.reload()">RELOAD APP</button>
+            ${debugButtonHtml()}
+          </section>
+        </main>`;
+    }
+
+    function safeRender() {
+      try {
+        render();
+      } catch (error) {
+        recordError("render.failed", error);
+        console.warn(error);
+        failureScreen("App could not render", "Reload once. If this repeats, copy the debug log and send it to Eswar.");
+      }
+    }
+
+    function handleUnhandledError(eventName, error) {
+      recordError(eventName, error);
+      console.warn(error);
+      failureScreen("App hit a startup error", "Reload once. If this repeats, copy the debug log and send it to Eswar.");
     }
 
     function render() {
@@ -3069,6 +3128,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     async function boot() {
+      window.addEventListener("error", event => handleUnhandledError("window.error", event.error || event.message));
+      window.addEventListener("unhandledrejection", event => handleUnhandledError("window.unhandledrejection", event.reason));
       bootScreen();
       const bootTimeout = setTimeout(() => {
         if (state.mode !== "boot") return;
@@ -3116,8 +3177,12 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         const appInstance = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
         db = getDatabase(appInstance);
         authService = getAuth(appInstance);
-        if (!authService.currentUser) await signInAnonymously(authService);
-        state.authUid = authService.currentUser?.uid || "";
+        let authUser = await waitForAuthUser(authService);
+        if (!authUser) {
+          await signInAnonymously(authService);
+          authUser = authService.currentUser;
+        }
+        state.authUid = authUser?.uid || authService.currentUser?.uid || "";
         state.authReady = Boolean(state.authUid);
         state.mode = "app";
         attachInviteListener();
@@ -3135,11 +3200,11 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           }
         }
         startCountdown();
-        render();
+        safeRender();
       } catch (error) {
         recordError("boot.firebase_failed", error);
         console.warn(error);
-        app.innerHTML = `<main class="setup"><section class="setup-card stack"><h1 class="title">Firebase did not start</h1><p>Check the config block, Anonymous Auth, and Realtime Database URL.</p>${debugButtonHtml()}</section></main>`;
+        failureScreen("Firebase did not start", "Check the config block, Anonymous Auth, and Realtime Database URL.");
       } finally {
         clearTimeout(bootTimeout);
       }
