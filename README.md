@@ -44,11 +44,12 @@ If Firebase is not configured yet, the setup screen includes **Start Local Test 
 
 For multi-user local testing:
 
-- Tap **Seed 12 Test Players** on the setup screen, or **Seed 12** from the local test banner.
+- Tap **Seed 15 Test Players** on the setup screen, or **Seed Demo** from the local test banner.
 - Use **Switch** to join manually as another player in the same tab.
 - Open per-player tabs with `?local=1&player=Alex`, for example `http://127.0.0.1:3000/?local=1&player=Blake`.
 - Add `reset=1` once to clear local test data before a run: `http://127.0.0.1:3000/?local=1&reset=1&player=Alex`.
 - Add `lobby=1` on localhost to preview the pre-trip lobby while still using local test data: `http://127.0.0.1:3000/?local=1&lobby=1`.
+- Add `openIn=5` with `lobby=1` on localhost to simulate the trip unlocking after 5 seconds: `http://127.0.0.1:3000/?local=1&lobby=1&openIn=5&player=Alex`.
 
 Local mode serializes same-browser writes with the browser Web Locks API when available. The real 12-phone production test should still use Firebase Realtime Database, because that is the production sync layer.
 

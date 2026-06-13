@@ -27,7 +27,25 @@ export default function Page() {
       { id: "veto", emoji: "🧊", name: "Chill Card", desc: "Veto one plan change. The itinerary holds." },
       { id: "throne", emoji: "🛌", name: "Backseat Throne", desc: "Claim the whole back row for one nap leg." },
       { id: "navi", emoji: "🧭", name: "Navigator's Whim", desc: "Add one detour of your choice (max 20 min)." },
-      { id: "snack", emoji: "🍿", name: "Snack Tax", desc: "Take one bite/handful of anyone's snack. They cannot refuse." }
+      { id: "snack", emoji: "🍿", name: "Snack Tax", desc: "Take one bite/handful of anyone's snack. They cannot refuse." },
+      { id: "photo-director", emoji: "🎬", name: "Photo Director", desc: "Direct one group photo pose. Everyone follows your creative vision." },
+      { id: "coffee", emoji: "☕", name: "Coffee Captain", desc: "Call one coffee stop or choose the coffee order timing." },
+      { id: "window", emoji: "🌲", name: "Window Claim", desc: "Claim a window seat for one drive segment." },
+      { id: "weather", emoji: "🌦️", name: "Weather Wizard", desc: "Choose indoor backup or outdoor courage for one iffy-weather moment." },
+      { id: "souvenir", emoji: "🧢", name: "Souvenir Scout", desc: "Pick one souvenir-shop stop or five-minute browse window." },
+      { id: "silence", emoji: "🤫", name: "Quiet Mile", desc: "Declare ten peaceful minutes. Low voices, no chaos." },
+      { id: "view", emoji: "🔭", name: "Viewpoint Veto", desc: "Force one scenic pull-off vote to happen immediately." },
+      { id: "stretch", emoji: "🧘", name: "Stretch Break", desc: "Call a quick stretch break at the next safe stop." },
+      { id: "navigator", emoji: "🗺️", name: "Map Master", desc: "Take over navigation decisions until the next planned stop." },
+      { id: "dessert", emoji: "🍩", name: "Dessert Decree", desc: "Choose the dessert or sweet-stop plan once." },
+      { id: "memory", emoji: "📓", name: "Memory Keeper", desc: "Make everyone share one favorite moment before the next stop." },
+      { id: "wild-photo", emoji: "🤳", name: "Selfie Strike", desc: "Call an instant selfie with whoever is closest to you." },
+      { id: "hydration", emoji: "💧", name: "Water Warden", desc: "Make the crew hydrate before the next long drive leg." },
+      { id: "fuel-boss", emoji: "⛽", name: "Fuel Boss", desc: "Call the next fuel stop or decide who scouts gas prices." },
+      { id: "anthem", emoji: "🎶", name: "Bridge Anthem", desc: "Choose the song that plays over the next bridge or viewpoint." },
+      { id: "tie-breaker", emoji: "⚖️", name: "Tie Breaker", desc: "Break one tied group vote with your final call." },
+      { id: "car-reset", emoji: "🧼", name: "Car Reset", desc: "Call a five-minute trash, bag, and snack cleanup reset." },
+      { id: "story", emoji: "📣", name: "Story Time", desc: "Pick someone to tell a road-trip story before the next stop." }
     ];
 
     const DARES = [
@@ -278,6 +296,7 @@ export default function Page() {
     const TRIP_OPEN_LABEL = "June 20, 2026 at 12:00 AM PT";
     const APP_BUILD = process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA || process.env.NEXT_PUBLIC_APP_VERSION || "";
     const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice", "join", "postLobbyComment", "copyDiagnostics"]);
+    const LOCAL_TRIP_OPEN_AT = localTripOpenOverrideAt();
 
     const app = document.getElementById("app");
     const photoInput = document.getElementById("photoInput");
@@ -309,8 +328,11 @@ export default function Page() {
     const LOCAL_LISTENERS = new Set();
     const LOCAL_TEST_NAMES = [
       "Alex", "Blake", "Casey", "Devon", "Emery", "Finley",
-      "Gray", "Harper", "Indy", "Jules", "Kai", "Logan"
+      "Gray", "Harper", "Indy", "Jules", "Kai", "Logan",
+      "Milan", "Noor", "Parker"
     ];
+    const LOCAL_DEMO_PHOTO =
+      "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='900' height='650' viewBox='0 0 900 650'%3E%3Crect width='900' height='650' fill='%23ecf4ee'/%3E%3Cpath d='M0 520 C140 470 210 560 360 510 C520 455 610 555 900 488 L900 650 L0 650 Z' fill='%232c6b52'/%3E%3Cpath d='M0 570 C160 520 260 610 430 555 C600 500 690 600 900 535 L900 650 L0 650 Z' fill='%2316463a'/%3E%3Ccircle cx='715' cy='125' r='64' fill='%23f2762e'/%3E%3Cpath d='M415 95 C360 200 500 245 430 365 C390 435 455 510 520 455 C585 400 545 330 605 250 C660 175 555 75 415 95 Z' fill='%232e8fa3'/%3E%3Cpath d='M470 110 C430 210 535 250 482 350 C450 410 500 455 545 415 C585 380 560 315 610 250 C650 195 590 120 470 110 Z' fill='%23ffffff' opacity='.72'/%3E%3Ctext x='48' y='94' fill='%2316463a' font-family='Arial,sans-serif' font-size='44' font-weight='700'%3EOregon or Bust%3C/text%3E%3Ctext x='52' y='144' fill='%232c6b52' font-family='Arial,sans-serif' font-size='28'%3ELocal demo photo%3C/text%3E%3C/svg%3E";
 
     const state = {
       mode: "boot",
@@ -363,12 +385,20 @@ export default function Page() {
     }
 
     function tripLocked() {
-      return Date.now() < TRIP_OPEN_AT && (!localMode || localLobbyPreview());
+      return Date.now() < tripOpenAt() && (!localMode || localLobbyPreview());
+    }
+
+    function tripOpenAt() {
+      return localMode && localLobbyPreview() && LOCAL_TRIP_OPEN_AT != null ? LOCAL_TRIP_OPEN_AT : TRIP_OPEN_AT;
+    }
+
+    function tripOpenLabel() {
+      return localMode && localLobbyPreview() && LOCAL_TRIP_OPEN_AT != null ? "local test unlock" : TRIP_OPEN_LABEL;
     }
 
     function ensureTripOpen() {
       if (!tripLocked()) return true;
-      toast(`Oregon or Bust opens ${TRIP_OPEN_LABEL}.`);
+      toast(`Oregon or Bust opens ${tripOpenLabel()}.`);
       render();
       return false;
     }
@@ -431,6 +461,15 @@ export default function Page() {
     function localLobbyPreview() {
       const params = new URLSearchParams(location.search);
       return localHostAllowed() && localRequested() && (params.get("lobby") === "1" || params.get("pretrip") === "1");
+    }
+
+    function localTripOpenOverrideAt() {
+      if (!localHostAllowed() || !localRequested()) return null;
+      const params = new URLSearchParams(location.search);
+      if (params.get("open") === "1" || params.get("unlock") === "1") return 0;
+      const openIn = Number(params.get("openIn") || "");
+      if (!Number.isFinite(openIn) || openIn < 0 || openIn > 120) return null;
+      return Date.now() + openIn * 1000;
     }
 
     function localResetRequested() {
@@ -661,7 +700,7 @@ export default function Page() {
       state.name = storedName();
       state.invitedNames = LOCAL_TEST_NAMES;
       state.loaded.invites = true;
-      if (!state.nameDraft) state.nameDraft = state.name || LOCAL_TEST_NAMES[0];
+      if (!state.nameDraft) state.nameDraft = state.name || "";
       localChannel = "BroadcastChannel" in window ? new BroadcastChannel("oob-local-db") : null;
       localChannel?.addEventListener("message", event => {
         if (event.data?.type === "change") localNotify();
@@ -1095,7 +1134,7 @@ NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=...
 NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             <p class="muted">Create a free Firebase project, enable Realtime Database in test mode, then add these values in Vercel or a local .env.local file.</p>
             <button class="btn falls" data-action="startLocal">START LOCAL TEST MODE</button>
-            <button class="btn sand" data-action="seedLocal">ADD 12 TEST PLAYERS</button>
+            <button class="btn sand" data-action="seedLocal">ADD 15 TEST PLAYERS</button>
             ${debugButtonHtml()}
             <p class="muted mini" style="margin:0">Local test mode stores data in this browser and syncs across tabs on this machine. It is only for development.</p>
           </section>
@@ -1119,7 +1158,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             <div class="between">
               <div>
                 <h1 class="title">Lobby</h1>
-                <p class="muted">Game actions unlock ${TRIP_OPEN_LABEL}.</p>
+                <p class="muted">Game actions unlock ${tripOpenLabel()}.</p>
               </div>
               <div class="lobby-you">${avatar(state.name)}<span>${escapeHtml(state.name)}</span></div>
             </div>
@@ -1130,7 +1169,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             </div>
             <section class="panel sand" style="box-shadow:none">
               <h2 class="section-title" data-countdown-title>Unlock Countdown</h2>
-              ${countdownHtml(TRIP_OPEN_AT)}
+              ${countdownHtml(tripOpenAt())}
             </section>
             <section class="panel" style="box-shadow:none">
               <div class="between">
@@ -1171,8 +1210,12 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     function renderJoin() {
       const names = invitedNameOptions();
       const inviteReady = localMode || state.loaded.invites;
-      const selectedName = sanitizeName(state.nameDraft) || names[0] || "";
-      const nameOptions = names.map(name => `<option value="${escapeHtml(name)}" ${name === selectedName ? "selected" : ""}>${escapeHtml(name)}</option>`).join("");
+      const selectedName = sanitizeName(state.nameDraft);
+      const hasSelectedName = names.includes(selectedName);
+      const nameOptions = [
+        `<option value="" ${hasSelectedName ? "" : "selected"} disabled>Select your invited name</option>`,
+        ...names.map(name => `<option value="${escapeHtml(name)}" ${name === selectedName ? "selected" : ""}>${escapeHtml(name)}</option>`)
+      ].join("");
       const preTrip = tripLocked();
       app.innerHTML = `
         <main class="join">
@@ -2077,19 +2120,53 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       }
     }
 
-    function dealCards() {
-      const deck = [...DECK];
+    function shuffleCards(cards) {
+      const deck = [...cards];
       for (let i = deck.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [deck[i], deck[j]] = [deck[j], deck[i]];
       }
-      return deck.slice(0, 2).map(card => ({ ...card, used: false }));
+      return deck;
+    }
+
+    function cardById(cardId) {
+      return DECK.find(card => card.id === cardId);
+    }
+
+    function cardsFromIds(cardIds) {
+      return cardIds
+        .map(cardById)
+        .filter(Boolean)
+        .map(card => ({ ...card, used: false }));
+    }
+
+    async function claimUniqueCards(name) {
+      const result = await ref("cardClaims").transaction(current => {
+        const claims = current && typeof current === "object" && !Array.isArray(current) ? { ...current } : {};
+        const alreadyMine = DECK.map(card => card.id).filter(cardId => claims[cardId] === name);
+        if (alreadyMine.length >= 2) return claims;
+        const claimed = new Set(Object.keys(claims).filter(cardId => claims[cardId]));
+        const available = DECK.map(card => card.id).filter(cardId => !claimed.has(cardId));
+        shuffleCards(available).slice(0, 2 - alreadyMine.length).forEach(cardId => {
+          claims[cardId] = name;
+        });
+        return claims;
+      });
+      const claims = result.snapshot.val() || {};
+      let cardIds = DECK.map(card => card.id).filter(cardId => claims[cardId] === name).slice(0, 2);
+      if (cardIds.length < 2) {
+        const fallback = shuffleCards(DECK.map(card => card.id))
+          .filter(cardId => !cardIds.includes(cardId))
+          .slice(0, 2 - cardIds.length);
+        cardIds = [...cardIds, ...fallback];
+      }
+      return cardsFromIds(cardIds);
     }
 
     async function ensurePlayerHand(name) {
       const handSnap = await ref(`hands/${name}`).once("value");
       if (handSnap.exists()) return null;
-      const cards = dealCards();
+      const cards = await claimUniqueCards(name);
       await ref(`hands/${name}`).set(cards);
       return cards;
     }
@@ -2111,7 +2188,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       try {
         const result = await ref(`roster/${state.name}`).transaction(current => current === true ? undefined : true);
         if (result.committed) {
-          await ref(`hands/${state.name}`).set(dealCards());
+          await ensurePlayerHand(state.name);
           await ref(`scores/${state.name}`).transaction(value => (Number(value) || 0) + 25);
           await pushFeed(`🚗 ${state.name} hopped in the car (+25)`);
         } else {
@@ -2242,7 +2319,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         state.selectedStopId = stopId;
         setPlayerRouteProgress(ROUTE_KEY, state.name, result.snapshot.val() || {});
         render();
-        toast(checked ? "Checklist item cleared." : "Checklist item reopened.");
+        toast(checked ? "Checklist item checked." : "Checklist item cleared.");
       } catch (error) {
         toast("Checklist did not sync.");
         render();
@@ -2738,7 +2815,6 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           if (child.val()) rows.push(sanitizeName(child.key));
         });
         state.invitedNames = rows.filter(Boolean).sort((a, b) => a.localeCompare(b));
-        if (!state.nameDraft && state.invitedNames.length) state.nameDraft = state.invitedNames[0];
         state.loaded.invites = true;
         render();
       });
@@ -2812,7 +2888,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         }
         if (tripLocked()) {
           const countdown = document.querySelector("[data-countdown]");
-          if (countdown) countdown.outerHTML = countdownHtml(TRIP_OPEN_AT);
+          if (countdown) countdown.outerHTML = countdownHtml(tripOpenAt());
           return;
         }
         if (!state.name || state.tab !== "home") return;
@@ -2942,9 +3018,23 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           await ref(`roster/${name}`).set(true);
           const scoreSnap = await ref(`scores/${name}`).once("value");
           if (!scoreSnap.exists()) await ref(`scores/${name}`).set(25 + (index % 4) * 3);
-          const handSnap = await ref(`hands/${name}`).once("value");
-          if (!handSnap.exists()) await ref(`hands/${name}`).set(dealCards());
+          await ensurePlayerHand(name);
           await ref(`hype/by/${name}`).transaction(value => Number(value || 0));
+        }
+        const demoMission = MISSIONS.find(mission => mission.id === "free") || MISSIONS[0];
+        const demoPhotoSnap = await ref("photos/local-demo-photo").once("value");
+        if (!demoPhotoSnap.exists()) {
+          await ref("photos/local-demo-photo").set({
+            name: "Blake",
+            missionId: demoMission.id,
+            missionTitle: demoMission.title,
+            pts: demoMission.pts,
+            caption: "Local test photo for reaction QA.",
+            dataUrl: LOCAL_DEMO_PHOTO,
+            ts: Date.now() - 1000,
+            reactions: {}
+          });
+          await ref(`missionClaims/${demoMission.id}/Blake`).set({ photoId: "local-demo-photo", ts: Date.now() - 1000 });
         }
         await ref("feed").push({
           ts: Date.now(),

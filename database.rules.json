@@ -63,6 +63,14 @@
       }
     },
 
+    "cardClaims": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "$cardId": {
+        ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 24"
+      }
+    },
+
     "scores": {
       ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
       "$name": {
