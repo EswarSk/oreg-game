@@ -1,0 +1,19 @@
+{
+  "name": "Oregon or Bust",
+  "short_name": "Oregon",
+  "description": "Mobile multiplayer road-trip game for Seattle to Oregon.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ECF4EE",
+  "theme_color": "#0C211B",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

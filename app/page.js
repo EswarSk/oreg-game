@@ -44,7 +44,7 @@ export default function Page() {
       { id: "fuel-boss", emoji: "⛽", name: "Fuel Boss", desc: "Call the next fuel stop or decide who scouts gas prices." },
       { id: "anthem", emoji: "🎶", name: "Bridge Anthem", desc: "Choose the song that plays over the next bridge or viewpoint." },
       { id: "tie-breaker", emoji: "⚖️", name: "Tie Breaker", desc: "Break one tied group vote with your final call." },
-      { id: "car-reset", emoji: "🧼", name: "Car Reset", desc: "Call a five-minute trash, bag, and snack cleanup reset." },
+      { id: "car-reset", emoji: "🧼", name: "Car Reset Pass", desc: "When the crew does a car cleanup reset, you may sit out or appoint yourself supervisor. Everyone else handles the mess." },
       { id: "story", emoji: "📣", name: "Story Time", desc: "Pick someone to tell a road-trip story before the next stop." }
     ];
 
@@ -319,12 +319,23 @@ export default function Page() {
     let feedBootstrapped = false;
     const seenFeedIds = new Set();
     let photosBootstrapped = false;
+    let cacheWriteTimer = null;
+    let queueFlushInProgress = false;
 
     const LOCAL_DB_KEY = "oob:local-db";
     const LOCAL_MODE_KEY = "oob:local-mode";
     const LOCAL_NAME_KEY = "oob:local-name";
     const DEBUG_LOG_KEY = "oob:debug-log";
     const DEBUG_LOG_LIMIT = 40;
+    const STATE_CACHE_KEY = "oob:last-state:v2";
+    const STATE_CACHE_VERSION = 2;
+    const STATE_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+    const ACTION_QUEUE_KEY = "oob:action-queue:v1";
+    const ACTION_QUEUE_LIMIT = 80;
+    const PHOTO_INITIAL_LIMIT = 8;
+    const PHOTO_LOAD_STEP = 8;
+    const PHOTO_CACHE_LIMIT = 3;
+    const PHOTO_CACHE_MAX_BYTES = 180 * 1024;
     const LOCAL_LISTENERS = new Set();
     const LOCAL_TEST_NAMES = [
       "Alex", "Blake", "Casey", "Devon", "Emery", "Finley",
@@ -363,9 +374,12 @@ export default function Page() {
       photos: [],
       optimisticPhotos: [],
       missionClaims: {},
-      photoLimit: 20,
+      photoLimit: PHOTO_INITIAL_LIMIT,
       confirmDialog: null,
       connected: true,
+      cacheRestored: false,
+      cacheTs: 0,
+      pendingActions: readQueuedActions().length,
       spinning: false,
       spinningName: "",
       activityDot: false,
@@ -467,6 +481,7 @@ export default function Page() {
       if (!localHostAllowed() || !localRequested()) return null;
       const params = new URLSearchParams(location.search);
       if (params.get("open") === "1" || params.get("unlock") === "1") return 0;
+      if (!params.has("openIn")) return null;
       const openIn = Number(params.get("openIn") || "");
       if (!Number.isFinite(openIn) || openIn < 0 || openIn > 120) return null;
       return Date.now() + openIn * 1000;
@@ -532,10 +547,14 @@ export default function Page() {
     }
 
     function storedName() {
-      if (localHostAllowed() && (localStorage.getItem(LOCAL_MODE_KEY) === "1" || localRequested())) {
-        return queryPlayerName() || sessionStorage.getItem(LOCAL_NAME_KEY) || "";
+      try {
+        if (localHostAllowed() && (localStorage.getItem(LOCAL_MODE_KEY) === "1" || localRequested())) {
+          return queryPlayerName() || sessionStorage.getItem(LOCAL_NAME_KEY) || "";
+        }
+        return sanitizeName(localStorage.getItem("oob:name") || "");
+      } catch {
+        return "";
       }
-      return "";
     }
 
     function storeName(name) {
@@ -813,6 +832,319 @@ export default function Page() {
     function truncate(value, max = 900) {
       const text = String(value ?? "");
       return text.length > max ? `${text.slice(0, max)}...` : text;
+    }
+
+    function storageGet(key) {
+      try {
+        return localStorage.getItem(key);
+      } catch {
+        return null;
+      }
+    }
+
+    function storageSet(key, value) {
+      try {
+        localStorage.setItem(key, value);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    function storageRemove(key) {
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        // Storage can fail in strict privacy modes; the app should still run live.
+      }
+    }
+
+    function firebaseReady() {
+      return localMode || Boolean(firebaseApi && db && activeFirebaseUser());
+    }
+
+    function canSyncNow() {
+      if (localMode) return true;
+      return firebaseReady() && state.connected && navigator.onLine !== false;
+    }
+
+    function isRetryableSyncError(error) {
+      const text = `${error?.code || ""} ${error?.name || ""} ${error?.message || error || ""}`;
+      return /network|offline|unavailable|disconnected|timeout|failed to fetch|client is offline|auth is still/i.test(text);
+    }
+
+    function readQueuedActions() {
+      const rows = safeJsonParse(storageGet(ACTION_QUEUE_KEY) || "[]", []);
+      return Array.isArray(rows) ? rows.filter(item => item && item.id && item.type).slice(-ACTION_QUEUE_LIMIT) : [];
+    }
+
+    function writeQueuedActions(rows) {
+      const queue = Array.isArray(rows) ? rows.slice(-ACTION_QUEUE_LIMIT) : [];
+      storageSet(ACTION_QUEUE_KEY, JSON.stringify(queue));
+      state.pendingActions = queue.length;
+      return queue;
+    }
+
+    function enqueueAction(type, payload) {
+      const entry = {
+        id: payload?.id || id(),
+        type,
+        name: payload?.name || state.name || "",
+        ts: payload?.ts || Date.now(),
+        payload: payload || {}
+      };
+      const queue = readQueuedActions();
+      const existingIndex = queue.findIndex(item => item.id === entry.id);
+      if (existingIndex >= 0) queue[existingIndex] = entry;
+      else queue.push(entry);
+      writeQueuedActions(queue);
+      scheduleStateCache();
+      return entry;
+    }
+
+    function readStateCache() {
+      const cache = safeJsonParse(storageGet(STATE_CACHE_KEY) || "null", null);
+      if (!cache || cache.version !== STATE_CACHE_VERSION || !cache.ts) return null;
+      if (Date.now() - Number(cache.ts) > STATE_CACHE_TTL_MS) {
+        storageRemove(STATE_CACHE_KEY);
+        return null;
+      }
+      return cache;
+    }
+
+    function cacheAgeLabel(ts) {
+      const seconds = Math.max(0, Math.round((Date.now() - Number(ts || 0)) / 1000));
+      if (seconds < 60) return "just now";
+      const minutes = Math.round(seconds / 60);
+      if (minutes < 60) return `${minutes} min ago`;
+      const hours = Math.round(minutes / 60);
+      if (hours < 24) return `${hours} hr ago`;
+      return `${Math.round(hours / 24)} day${hours >= 48 ? "s" : ""} ago`;
+    }
+
+    function safeArray(value, limit = 80) {
+      return Array.isArray(value) ? value.slice(0, limit) : [];
+    }
+
+    function safeObject(value) {
+      return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    }
+
+    function hydrateStateCache(renderNow = false) {
+      if (localMode) return false;
+      const cache = readStateCache();
+      if (!cache) return false;
+      const cachedName = sanitizeName(cache.name);
+      if (cachedName && !state.name) state.name = cachedName;
+      if (cachedName && !state.nameDraft) state.nameDraft = cachedName;
+      state.invitedNames = safeArray(cache.invitedNames, 40);
+      state.roster = safeArray(cache.roster, 40);
+      state.scores = safeObject(cache.scores);
+      state.hype = safeObject(cache.hype);
+      state.votes = safeObject(cache.votes);
+      state.stopVotes = safeObject(cache.stopVotes);
+      state.routeProgress = safeObject(cache.routeProgress);
+      state.feed = safeArray(cache.feed, 12);
+      state.lobbyMessages = safeArray(cache.lobbyMessages, 50);
+      state.hand = safeArray(cache.hand, 4);
+      state.hotseat = cache.hotseat || null;
+      state.history = safeArray(cache.history, 15);
+      state.photos = safeArray(cache.photos, PHOTO_CACHE_LIMIT);
+      state.missionClaims = safeObject(cache.missionClaims);
+      state.tab = validTab(cache.tab) ? cache.tab : state.tab;
+      state.selectedStopId = cache.selectedStopId || state.selectedStopId;
+      state.routeChoice = cache.routeChoice || state.routeChoice;
+      state.cacheRestored = true;
+      state.cacheTs = Number(cache.ts || Date.now());
+      state.pendingActions = readQueuedActions().length;
+      state.loaded = {
+        ...state.loaded,
+        roster: true,
+        scores: true,
+        hype: true,
+        votes: true,
+        feed: true,
+        hotseat: true,
+        hand: state.hand.length > 0 || state.loaded.hand,
+        photos: true,
+        history: true,
+        claims: true,
+        stopVotes: true,
+        routeProgress: true,
+        invites: state.invitedNames.length > 0 || state.loaded.invites,
+        lobby: true
+      };
+      if (state.name) state.mode = "app";
+      if (renderNow && state.name) safeRender();
+      return Boolean(state.name);
+    }
+
+    function cachedPhoto(photo) {
+      if (!photo?.dataUrl || dataUrlBytes(photo.dataUrl) > PHOTO_CACHE_MAX_BYTES) return null;
+      return {
+        id: photo.id,
+        name: photo.name,
+        missionId: photo.missionId,
+        missionTitle: photo.missionTitle,
+        pts: photo.pts,
+        caption: photo.caption || "",
+        dataUrl: photo.dataUrl,
+        ts: photo.ts || 0,
+        reactions: photo.reactions || {}
+      };
+    }
+
+    function scheduleStateCache() {
+      if (localMode || !state.name || state.mode === "boot" || state.mode === "setup") return;
+      clearTimeout(cacheWriteTimer);
+      cacheWriteTimer = setTimeout(writeStateCache, 250);
+    }
+
+    function writeStateCache() {
+      if (localMode || !state.name) return;
+      const photos = state.photos.map(cachedPhoto).filter(Boolean).slice(0, PHOTO_CACHE_LIMIT);
+      const cache = {
+        version: STATE_CACHE_VERSION,
+        ts: Date.now(),
+        name: state.name,
+        tab: state.tab,
+        selectedStopId: state.selectedStopId,
+        routeChoice: state.routeChoice,
+        invitedNames: state.invitedNames.slice(0, 40),
+        roster: state.roster.slice(0, 40),
+        scores: state.scores,
+        hype: state.hype,
+        votes: state.votes,
+        stopVotes: state.stopVotes,
+        routeProgress: state.routeProgress,
+        feed: state.feed.slice(0, 12),
+        lobbyMessages: state.lobbyMessages.slice(0, 50),
+        hand: state.hand.slice(0, 4),
+        hotseat: state.hotseat,
+        history: state.history.slice(0, 15),
+        photos,
+        missionClaims: state.missionClaims
+      };
+      if (!storageSet(STATE_CACHE_KEY, JSON.stringify(cache))) {
+        cache.photos = [];
+        storageSet(STATE_CACHE_KEY, JSON.stringify(cache));
+      }
+    }
+
+    async function drainActionQueue() {
+      if (queueFlushInProgress || !canSyncNow()) return;
+      let queue = readQueuedActions();
+      if (!queue.length) {
+        writeQueuedActions([]);
+        return;
+      }
+      queueFlushInProgress = true;
+      const remaining = [];
+      try {
+        for (const entry of queue) {
+          if (!canSyncNow()) {
+            remaining.push(entry, ...queue.slice(queue.indexOf(entry) + 1));
+            break;
+          }
+          try {
+            await applyQueuedAction(entry);
+          } catch (error) {
+            if (isRetryableSyncError(error)) {
+              remaining.push(entry, ...queue.slice(queue.indexOf(entry) + 1));
+              break;
+            }
+            recordError("queue.action_dropped", error, { queuedType: entry.type, queuedId: entry.id });
+          }
+        }
+      } finally {
+        queueFlushInProgress = false;
+        writeQueuedActions(remaining);
+        if (!remaining.length && queue.length) toast("Saved updates synced.");
+        render();
+      }
+    }
+
+    async function applyQueuedAction(entry) {
+      const payload = entry.payload || {};
+      const name = sanitizeName(payload.name || entry.name || state.name);
+      if (!name) throw new Error("Queued action is missing player name.");
+      if (entry.type === "lobbyComment") {
+        const text = String(payload.text || "").trim().slice(0, 120);
+        if (!text) return;
+        await ref(`lobbyMessages/${entry.id}`).set({ name, text, ts: Number(payload.ts || entry.ts || Date.now()) });
+        return;
+      }
+      if (entry.type === "stopVote") {
+        const route = payload.route || ROUTE_KEY;
+        const stopId = payload.stopId || "";
+        const vibe = payload.vibe || "";
+        if (!stopId || !STOP_VIBES.some(item => item.id === vibe)) return;
+        await ref(`stopVotes/${route}/${stopId}/${name}`).set(vibe);
+        if (payload.feedText && payload.feedId) {
+          await ref(`feed/${payload.feedId}`).set({ ts: Number(payload.ts || Date.now()), name, text: payload.feedText });
+        }
+        return;
+      }
+      if (entry.type === "levelTask") {
+        const stopId = payload.stopId || "";
+        const taskId = payload.taskId || "";
+        const checked = Boolean(payload.checked);
+        if (!stopId || !taskId) return;
+        await ref(`routeProgress/${ROUTE_KEY}/players/${name}`).transaction(current => {
+          current = current || {};
+          if (current.completed?.[stopId]) return current;
+          const tasks = current.tasks || {};
+          const stopTasks = { ...(tasks[stopId] || {}) };
+          if (checked) stopTasks[taskId] = { by: name, ts: Number(payload.ts || Date.now()) };
+          else delete stopTasks[taskId];
+          return {
+            ...current,
+            tasks: {
+              ...tasks,
+              [stopId]: stopTasks
+            }
+          };
+        });
+        return;
+      }
+      if (entry.type === "completeLevel") {
+        const stopId = payload.stopId || "";
+        const stop = routeStops().find(item => item.id === stopId);
+        if (!stop) return;
+        const stamp = { by: name, ts: Number(payload.ts || Date.now()), queueId: entry.id };
+        let shouldAward = false;
+        await ref(`routeProgress/${ROUTE_KEY}/players/${name}`).transaction(current => {
+          current = current || {};
+          const completed = current.completed || {};
+          if (completed[stop.id]) return current;
+          shouldAward = true;
+          return {
+            ...current,
+            completed: {
+              ...completed,
+              [stop.id]: stamp
+            }
+          };
+        });
+        if (shouldAward) {
+          await ref(`scores/${name}`).transaction(value => (Number(value) || 0) + 15);
+          await ref(`feed/${payload.feedId || id()}`).set({
+            ts: Number(payload.ts || Date.now()),
+            name,
+            text: `🏁 ${name} cleared Level ${stop.level}: ${stop.name} (+15)`
+          });
+        }
+        return;
+      }
+      if (entry.type === "reaction") {
+        const photoId = payload.photoId || "";
+        const emoji = payload.emoji || "";
+        if (!photoId || !REACTIONS.includes(emoji)) return;
+        await Promise.all(REACTIONS
+          .filter(item => item !== emoji)
+          .map(item => ref(`photos/${photoId}/reactions/${item}/${name}`).remove()));
+        await ref(`photos/${photoId}/reactions/${emoji}/${name}`).set(true);
+      }
     }
 
     function storedDiagnostics() {
@@ -1108,12 +1440,31 @@ export default function Page() {
       if (!state.name) return toast("Join the lobby first.");
       const text = String(state.lobbyDraft || document.getElementById("lobbyCommentInput")?.value || "").trim().slice(0, 120);
       if (!text) return toast("Write a comment first.");
+      const ts = Date.now();
+      const commentId = `comment_${ts}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20)}`;
+      const optimistic = { id: commentId, name: state.name, text, ts, queued: true };
+      if (!canSyncNow()) {
+        state.lobbyMessages = [optimistic, ...state.lobbyMessages.filter(item => item.id !== commentId)].slice(0, 50);
+        state.lobbyDraft = "";
+        enqueueAction("lobbyComment", { id: commentId, name: state.name, text, ts });
+        toast("Comment saved. It will post when signal returns.");
+        render();
+        return;
+      }
       try {
-        await ref("lobbyMessages").push({ name: state.name, text, ts: Date.now() });
+        await ref(`lobbyMessages/${commentId}`).set({ name: state.name, text, ts });
         state.lobbyDraft = "";
         render();
         pruneLobbyMessages();
       } catch (error) {
+        if (isRetryableSyncError(error)) {
+          state.lobbyMessages = [optimistic, ...state.lobbyMessages.filter(item => item.id !== commentId)].slice(0, 50);
+          state.lobbyDraft = "";
+          enqueueAction("lobbyComment", { id: commentId, name: state.name, text, ts });
+          toast("Comment saved. It will retry when signal returns.");
+          render();
+          return;
+        }
         recordError("lobby_comment.failed", error, { textLength: text.length });
         toast("Lobby comment did not post.");
         console.warn(error);
@@ -1213,6 +1564,21 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       failureScreen("App hit a startup error", "Reload once. If this repeats, copy the debug log and send it to Eswar.");
     }
 
+    function syncNoticeHtml() {
+      if (localMode) return "";
+      const queued = Number(state.pendingActions || 0);
+      if (state.cacheRestored && !firebaseReady()) {
+        return `<div class="offline">Showing saved trip screen from ${escapeHtml(cacheAgeLabel(state.cacheTs))}. Connecting...</div>`;
+      }
+      if (queued) {
+        return `<div class="offline">Saved ${queued} update${queued === 1 ? "" : "s"} for retry when signal returns.</div>`;
+      }
+      if (!state.connected || navigator.onLine === false) {
+        return `<div class="offline">Reconnecting... lightweight taps are saved; uploads may need a retry.</div>`;
+      }
+      return "";
+    }
+
     function render() {
       if (state.mode === "boot") return bootScreen();
       if (state.mode === "setup") return setupScreen();
@@ -1228,6 +1594,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         <main class="join lobby">
           <div class="logo" style="margin:auto">OREGON<span>OR BUST</span><small>Seattle -> Oregon</small></div>
           <section class="join-card stack lobby-card">
+            ${syncNoticeHtml()}
             <div class="between">
               <div>
                 <h1 class="title">Lobby</h1>
@@ -1278,6 +1645,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             ${debugButtonHtml()}
           </section>
         </main>`;
+      scheduleStateCache();
     }
 
     function renderJoin() {
@@ -1339,12 +1707,13 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       app.innerHTML = `
         <main class="screen stack">
           ${localMode ? `<div class="offline local-banner"><span>Local test mode${state.name ? ` - ${escapeHtml(state.name)}` : ""}</span><button data-action="seedLocal">Seed Demo</button><button data-action="switchLocal">Switch</button><button data-action="resetLocal">Reset</button></div>` : ""}
-          ${state.connected ? "" : `<div class="offline">Reconnecting... your taps will sync when you're back</div>`}
+          ${syncNoticeHtml()}
           ${debugButtonHtml()}
           ${content}
         </main>
         ${confirmDialogHtml()}
         ${tabbar()}`;
+      scheduleStateCache();
     }
 
     function confirmDialogHtml() {
@@ -1951,7 +2320,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         <section class="tight">
           <h2 class="section-title">The Wall</h2>
           ${photos.length ? photos.map(photoCard).join("") : `<div class="panel"><div class="empty">No photos yet - the first legendary moment is up for grabs.</div></div>`}
-          ${state.photos.length >= state.photoLimit ? `<button class="btn sand" data-action="loadPhotos">Load 20 more</button>` : ""}
+          ${state.photos.length >= state.photoLimit ? `<button class="btn sand" data-action="loadPhotos">Load ${PHOTO_LOAD_STEP} more</button>` : ""}
         </section>
       </div>`;
     }
@@ -1972,7 +2341,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const counts = reactionCounts(photo);
       const mine = myReaction(photo);
       return `<article class="photo-card ${photo.posting ? "posting skeletonish" : ""}">
-        <img src="${escapeHtml(photo.dataUrl)}" alt="${escapeHtml(photo.missionTitle)}" loading="lazy">
+        ${photo.dataUrl ? `<img src="${escapeHtml(photo.dataUrl)}" alt="${escapeHtml(photo.missionTitle)}" loading="lazy">` : `<div class="photo-placeholder">Photo will reload when signal returns</div>`}
         <div class="photo-body">
           <div class="between">
             <div class="row">${avatar(photo.name)}<strong>${escapeHtml(photo.name)}</strong></div>
@@ -1983,6 +2352,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           <div class="reactions">
             ${REACTIONS.map(emoji => `<button class="reaction ${mine === emoji ? "active" : ""}" data-action="react" data-photo="${photo.id}" data-emoji="${emoji}" ${photo.posting ? "disabled" : ""}>${emoji} <span class="mono">${counts[emoji] || 0}</span></button>`).join("")}
           </div>
+          ${photo.name === state.name && !photo.posting ? `<button class="btn small red photo-delete" data-action="deletePhoto" data-photo="${photo.id}">DELETE PHOTO</button>` : ""}
         </div>
       </article>`;
     }
@@ -1995,6 +2365,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function myReaction(photo) {
       return REACTIONS.find(emoji => photo.reactions?.[emoji]?.[state.name]) || "";
+    }
+
+    function reactionNames(photo) {
+      return [...new Set(REACTIONS.flatMap(emoji => Object.keys(photo.reactions?.[emoji] || {})))];
     }
 
     function hotseatTab() {
@@ -2052,7 +2426,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       return `<div class="stack">
         <section class="panel sand">
           <h1 class="section-title">Wild Cards</h1>
-          <p class="muted" style="margin:0">Your secret hand - nobody sees a card until you play it. One use each, so time it well.</p>
+          <p class="muted" style="margin:0">Your secret powers. Use a card when you want its advantage; the crew follows the card. One use each.</p>
         </section>
         <div class="card-hand">
           ${state.hand.length ? state.hand.map((card, index) => renderWildCard(card, index, false)).join("") : missingHandHtml()}
@@ -2075,7 +2449,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         <div class="emoji">${card.emoji}</div>
         <h3 class="bungee">${escapeHtml(card.name)}</h3>
         <p>${escapeHtml(card.desc)}</p>
-        ${card.used ? `<p class="mono mini">✅ played ${formatDateTime(card.usedAt)}</p>` : reveal ? "" : `<button class="btn" data-action="playCard" data-index="${index}" aria-label="Play ${escapeHtml(card.name)} card for 5 points">PLAY ${escapeHtml(card.name)} (+5)</button>`}
+        ${card.used ? `<p class="mono mini">✅ used ${formatDateTime(card.usedAt)}</p>` : reveal ? "" : `<button class="btn" data-action="playCard" data-index="${index}" aria-label="Use ${escapeHtml(card.name)} card for 5 points">USE CARD (+5)</button>`}
       </article>`;
     }
 
@@ -2121,9 +2495,14 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     function activatePlayerSession(name) {
       const clean = sanitizeName(name);
       if (!clean) return;
+      const previousName = state.name;
       storeName(clean);
       state.name = clean;
       state.nameDraft = clean;
+      if (previousName !== clean) {
+        state.selectedStopId = "";
+        state.revealCards = null;
+      }
       attachLobbyListeners();
       if (!tripLocked()) {
         attachGlobalListeners();
@@ -2336,13 +2715,43 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         }
       };
       render();
+      const ts = Date.now();
+      const vibeLabel = STOP_VIBES.find(item => item.id === vibe)?.label || "vote";
+      const feedText = previous !== vibe ? `🗺️ ${state.name} marked ${stopName}: ${vibeLabel}` : "";
+      if (!canSyncNow()) {
+        enqueueAction("stopVote", {
+          id: `stop_${route}_${stopId}_${state.name}`,
+          route,
+          stopId,
+          vibe,
+          name: state.name,
+          ts,
+          feedId: feedText ? `feed_stop_${ts}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20)}` : "",
+          feedText
+        });
+        toast(`${vibeLabel} saved for retry.`);
+        return;
+      }
       try {
         await ref(`stopVotes/${route}/${stopId}/${state.name}`).set(vibe);
-        const vibeLabel = STOP_VIBES.find(item => item.id === vibe)?.label || "vote";
         toast(`${vibeLabel} marked.`);
         if (previous !== vibe) await pushFeed(`🗺️ ${state.name} marked ${stopName}: ${vibeLabel}`);
         target?.classList.add("active");
       } catch (error) {
+        if (isRetryableSyncError(error)) {
+          enqueueAction("stopVote", {
+            id: `stop_${route}_${stopId}_${state.name}`,
+            route,
+            stopId,
+            vibe,
+            name: state.name,
+            ts,
+            feedId: feedText ? `feed_stop_${ts}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20)}` : "",
+            feedText
+          });
+          toast(`${vibeLabel} saved. It will retry when signal returns.`);
+          return;
+        }
         const routeVotes = { ...(state.stopVotes?.[route] || {}) };
         const stopVotes = { ...(routeVotes[stopId] || {}) };
         if (previous) stopVotes[state.name] = previous; else delete stopVotes[state.name];
@@ -2354,6 +2763,22 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       }
     }
 
+    function applyLocalLevelTask(stopId, taskId, checked, ts = Date.now()) {
+      const current = playerRouteProgress(ROUTE_KEY, state.name);
+      const tasks = { ...(current.tasks || {}) };
+      const stopTasks = { ...(tasks[stopId] || {}) };
+      if (checked) stopTasks[taskId] = { by: state.name, ts };
+      else delete stopTasks[taskId];
+      setPlayerRouteProgress(ROUTE_KEY, state.name, {
+        ...current,
+        tasks: {
+          ...tasks,
+          [stopId]: stopTasks
+        }
+      });
+      state.selectedStopId = stopId;
+    }
+
     async function toggleLevelTask(stopId, taskId) {
       if (!ensureTripOpen()) return;
       if (!state.name) return toast("Join the crew first.");
@@ -2361,6 +2786,22 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const stop = stops.find(item => item.id === stopId);
       const task = stop?.tasks?.find(item => item.id === taskId);
       if (!stop || !task) return;
+      const checkedNext = !Boolean(levelTaskData(stopId)[taskId]);
+      const ts = Date.now();
+      if (!canSyncNow()) {
+        applyLocalLevelTask(stopId, taskId, checkedNext, ts);
+        enqueueAction("levelTask", {
+          id: `task_${ROUTE_KEY}_${stopId}_${taskId}_${state.name}`,
+          name: state.name,
+          stopId,
+          taskId,
+          checked: checkedNext,
+          ts
+        });
+        render();
+        toast(checkedNext ? "Checklist saved for retry." : "Checklist clear saved for retry.");
+        return;
+      }
       let checked = false;
       try {
         const result = await ref(`routeProgress/${ROUTE_KEY}/players/${state.name}`).transaction(current => {
@@ -2394,6 +2835,20 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         render();
         toast(checked ? "Checklist item checked." : "Checklist item cleared.");
       } catch (error) {
+        if (isRetryableSyncError(error)) {
+          applyLocalLevelTask(stopId, taskId, checkedNext, ts);
+          enqueueAction("levelTask", {
+            id: `task_${ROUTE_KEY}_${stopId}_${taskId}_${state.name}`,
+            name: state.name,
+            stopId,
+            taskId,
+            checked: checkedNext,
+            ts
+          });
+          render();
+          toast("Checklist saved. It will retry when signal returns.");
+          return;
+        }
         toast("Checklist did not sync.");
         render();
         console.warn(error);
@@ -2416,8 +2871,31 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         return toast("Finish the level checklist first.");
       }
 
-      const stamp = { by: state.name, ts: Date.now() };
+      const completionTs = Date.now();
+      const queueId = `complete_${route}_${stop.id}_${state.name}_${completionTs}`;
+      const stamp = { by: state.name, ts: completionTs, queueId };
       const nextStop = stops[stop.level] || stop;
+
+      if (!canSyncNow()) {
+        setPlayerRouteProgress(route, state.name, {
+          ...playerRouteProgress(route, state.name),
+          completed: {
+            ...completedLevels(route),
+            [stop.id]: stamp
+          }
+        });
+        state.selectedStopId = nextStop.id;
+        enqueueAction("completeLevel", {
+          id: queueId,
+          name: state.name,
+          stopId: stop.id,
+          ts: completionTs,
+          feedId: `feed_complete_${completionTs}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20)}`
+        });
+        render();
+        toast(`Level ${nextStop.level === stop.level ? stop.level : nextStop.level} saved. Points sync when signal returns.`);
+        return;
+      }
 
       try {
         const result = await ref(`routeProgress/${route}/players/${state.name}`).transaction(current => {
@@ -2453,6 +2931,26 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         }
         target?.classList.add("active");
       } catch (error) {
+        if (isRetryableSyncError(error)) {
+          setPlayerRouteProgress(route, state.name, {
+            ...playerRouteProgress(route, state.name),
+            completed: {
+              ...completedLevels(route),
+              [stop.id]: stamp
+            }
+          });
+          state.selectedStopId = nextStop.id;
+          enqueueAction("completeLevel", {
+            id: queueId,
+            name: state.name,
+            stopId: stop.id,
+            ts: completionTs,
+            feedId: `feed_complete_${completionTs}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20)}`
+          });
+          toast("Level saved. It will retry when signal returns.");
+          render();
+          return;
+        }
         state.selectedStopId = stop.id;
         toast("Level did not sync.");
         render();
@@ -2508,20 +3006,26 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       if (!ensureTripOpen()) return;
       const card = state.hand[index];
       if (!card || card.used) return;
-      if (!await askConfirm(`Play ${card.name} now? The whole crew will see it.`, "Play card", "Play wild card?")) return;
+      if (!await askConfirm(`Use ${card.name} now? The whole crew will see this card's advantage.`, "Use card", "Use wild card?")) return;
       const prior = state.hand.map(item => ({ ...item }));
-      state.hand[index] = { ...card, used: true, usedAt: Date.now() };
+      const usedCard = { ...card, used: true, usedAt: Date.now() };
+      delete usedCard.skipped;
+      delete usedCard.skippedAt;
+      state.hand[index] = usedCard;
       render();
       try {
         const result = await ref(`hands/${state.name}/${index}`).transaction(current => {
           if (!current || current.used) return;
-          return { ...current, used: true, usedAt: Date.now() };
+          const next = { ...current, used: true, usedAt: Date.now() };
+          delete next.skipped;
+          delete next.skippedAt;
+          return next;
         });
         if (result.committed) {
           await addScore(state.name, 5, target);
-          await pushFeed(`🃏 ${state.name} played ${card.emoji} ${card.name.toUpperCase()}! ${card.desc} (+5)`);
+          await pushFeed(`🃏 ${state.name} used ${card.emoji} ${card.name.toUpperCase()}! ${card.desc} (+5)`);
         } else {
-          toast("That card was already played.");
+          toast("That card was already used.");
         }
       } catch (error) {
         state.hand = prior;
@@ -2657,6 +3161,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         toast("No photo selected.");
         return;
       }
+      if (!canSyncNow()) {
+        toast("Photo upload needs signal. Try again when the connection is back.");
+        return;
+      }
       const photoId = id();
       const tempId = `temp-${photoId}`;
       const claimPath = `missionClaims/${mission.id}/${state.name}`;
@@ -2724,16 +3232,16 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           const img = new Image();
           img.onerror = () => reject(new Error("That image could not be opened."));
           img.onload = () => {
-            const maxEdge = 700;
+            const maxEdge = 520;
             const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
             const canvas = document.createElement("canvas");
             canvas.width = Math.max(1, Math.round(img.width * scale));
             canvas.height = Math.max(1, Math.round(img.height * scale));
             const ctx = canvas.getContext("2d");
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-            let dataUrl = canvas.toDataURL("image/jpeg", .62);
-            if (dataUrlBytes(dataUrl) > 300 * 1024) dataUrl = canvas.toDataURL("image/jpeg", .45);
-            if (dataUrlBytes(dataUrl) > 300 * 1024) reject(new Error("Photo is still over 300KB after compression."));
+            let dataUrl = canvas.toDataURL("image/jpeg", .56);
+            if (dataUrlBytes(dataUrl) > PHOTO_CACHE_MAX_BYTES) dataUrl = canvas.toDataURL("image/jpeg", .4);
+            if (dataUrlBytes(dataUrl) > PHOTO_CACHE_MAX_BYTES) reject(new Error("Photo is still too large after compression."));
             else resolve(dataUrl);
           };
           img.src = reader.result;
@@ -2746,6 +3254,46 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const comma = dataUrl.indexOf(",");
       const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
       return Math.ceil(base64.length * 3 / 4);
+    }
+
+    async function deletePhoto(photoId) {
+      if (!ensureTripOpen()) return;
+      const photo = state.photos.find(item => item.id === photoId);
+      if (!photo) return toast("Photo is already gone.");
+      if (photo.name !== state.name) return toast("Only the person who posted this photo can delete it.");
+      if (!canSyncNow()) return toast("Photo delete needs signal. Try again when the connection is back.");
+      if (!await askConfirm("Delete this photo from the wall and reverse its photo/reaction points?", "Delete photo", "Delete photo?")) return;
+
+      const priorPhotos = state.photos;
+      const priorClaims = state.missionClaims;
+      const reactors = reactionNames(photo).filter(name => name && name !== photo.name);
+      const ownerDelta = -Number(photo.pts || 0) - reactors.length * 3;
+      state.photos = state.photos.filter(item => item.id !== photoId);
+      if (state.missionClaims?.[photo.missionId]?.[photo.name]?.photoId === photoId) {
+        const missionClaim = { ...(state.missionClaims[photo.missionId] || {}) };
+        delete missionClaim[photo.name];
+        state.missionClaims = {
+          ...state.missionClaims,
+          [photo.missionId]: missionClaim
+        };
+      }
+      render();
+
+      try {
+        const claimPath = `missionClaims/${photo.missionId}/${photo.name}`;
+        await ref(claimPath).transaction(current => current?.photoId === photoId ? null : current);
+        await ref(`photos/${photoId}`).remove();
+        if (ownerDelta) await addScore(photo.name, ownerDelta);
+        for (const reactor of reactors) await addScore(reactor, -2);
+        await pushFeed(`🗑️ ${state.name} deleted a mission photo; points were adjusted.`);
+        toast("Photo deleted.");
+      } catch (error) {
+        state.photos = priorPhotos;
+        state.missionClaims = priorClaims;
+        toast("Photo delete did not sync.");
+        render();
+        console.warn(error);
+      }
     }
 
     async function react(photoId, emoji, target) {
@@ -2767,6 +3315,18 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         return next;
       });
       render();
+      const reactionTs = Date.now();
+      if (!canSyncNow()) {
+        enqueueAction("reaction", {
+          id: `reaction_${photoId}_${state.name}`,
+          name: state.name,
+          photoId,
+          emoji,
+          ts: reactionTs
+        });
+        toast("Reaction saved for retry.");
+        return;
+      }
       const firstReaction = !REACTIONS.some(e => prior?.[e]?.[state.name]);
       try {
         await Promise.all(REACTIONS
@@ -2781,6 +3341,17 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           await pushFeed(`${state.name} reacted ${emoji} to ${photo.name || "someone"}'s photo`, state.name);
         }
       } catch (error) {
+        if (isRetryableSyncError(error)) {
+          enqueueAction("reaction", {
+            id: `reaction_${photoId}_${state.name}`,
+            name: state.name,
+            photoId,
+            emoji,
+            ts: reactionTs
+          });
+          toast("Reaction saved. It will retry when signal returns.");
+          return;
+        }
         state.photos = state.photos.map(item => item.id === photoId ? { ...item, reactions: prior } : item);
         toast("Reaction did not sync.");
         render();
@@ -2794,6 +3365,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       ref(".info/connected").on("value", snap => {
         state.connected = snap.val() !== false;
         render();
+        if (state.connected) drainActionQueue();
       });
       attachRosterListener();
       ref("scores").on("value", snap => {
@@ -2857,7 +3429,6 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         state.loaded.claims = true;
         render();
       });
-      ensurePhotosListener();
     }
 
     function attachRosterListener() {
@@ -2973,6 +3544,25 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       }, 1000);
     }
 
+    function registerServiceWorker() {
+      if (!("serviceWorker" in navigator)) return;
+      if (location.protocol !== "https:" && !localHostAllowed()) return;
+      navigator.serviceWorker.register("/sw.js").catch(error => {
+        recordError("service_worker.register_failed", error);
+      });
+    }
+
+    window.addEventListener("online", () => {
+      state.connected = true;
+      render();
+      drainActionQueue();
+    });
+
+    window.addEventListener("offline", () => {
+      state.connected = false;
+      render();
+    });
+
     window.addEventListener("error", event => {
       recordError("window.error", event.error || event.message, {
         source: event.filename || "",
@@ -3032,7 +3622,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       if (action === "repairHand") repairHand();
       if (action === "mission") pickMission(actionEl.dataset.mission);
       if (action === "react") react(actionEl.dataset.photo, actionEl.dataset.emoji, actionEl);
-      if (action === "loadPhotos") { state.photoLimit += 20; ensurePhotosListener(true); render(); }
+      if (action === "deletePhoto") deletePhoto(actionEl.dataset.photo);
+      if (action === "loadPhotos") { state.photoLimit += PHOTO_LOAD_STEP; ensurePhotosListener(true); render(); }
     });
 
     document.addEventListener("input", event => {
@@ -3067,6 +3658,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       handRef = null;
       state.name = "";
       state.nameDraft = "";
+      state.selectedStopId = "";
       state.tab = "home";
       updateTabParam(state.tab);
       state.hand = [];
@@ -3130,7 +3722,9 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     async function boot() {
       window.addEventListener("error", event => handleUnhandledError("window.error", event.error || event.message));
       window.addEventListener("unhandledrejection", event => handleUnhandledError("window.unhandledrejection", event.reason));
-      bootScreen();
+      registerServiceWorker();
+      const restoredFromCache = hydrateStateCache(true);
+      if (!restoredFromCache) bootScreen();
       const bootTimeout = setTimeout(() => {
         if (state.mode !== "boot") return;
         recordDiagnostic("boot.timeout", { firebaseConfigured: !configMissing() });
@@ -3197,9 +3791,14 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             }
             activatePlayerSession(profileName);
             if (!tripLocked()) await ensureGameEntry(profileName);
+          } else if (!state.cacheRestored) {
+            clearStoredName();
+            state.name = "";
+            state.nameDraft = "";
           }
         }
         startCountdown();
+        drainActionQueue();
         safeRender();
       } catch (error) {
         recordError("boot.firebase_failed", error);

@@ -152,8 +152,8 @@
       ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
       ".indexOn": ["ts"],
       "$photoId": {
-        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
-        ".validate": "!newData.exists() || !newData.child('name').exists() || newData.child('name').val() === root.child('players').child(auth.uid).child('name').val() || data.child('name').exists()",
+        ".write": "auth != null && now >= 1781938800000 && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && ((!data.exists() && newData.exists() && newData.child('name').val() === root.child('players').child(auth.uid).child('name').val()) || (data.exists() && !newData.exists() && data.child('name').val() === root.child('players').child(auth.uid).child('name').val()))",
+        ".validate": "!newData.exists() || (newData.hasChildren(['name', 'missionId', 'missionTitle', 'pts', 'dataUrl', 'ts']) && newData.child('name').isString() && newData.child('missionId').isString() && newData.child('missionTitle').isString() && newData.child('pts').isNumber() && newData.child('dataUrl').isString() && newData.child('ts').isNumber() && ((!data.exists() && newData.child('name').val() === root.child('players').child(auth.uid).child('name').val()) || (data.exists() && newData.child('name').val() === data.child('name').val())))",
         "reactions": {
           "$emoji": {
             "$name": {

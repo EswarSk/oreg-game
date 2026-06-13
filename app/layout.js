@@ -2,7 +2,8 @@ import "./globals.css";
 
 export const metadata = {
   title: "Oregon or Bust",
-  description: "Mobile multiplayer road-trip game for Seattle to Oregon."
+  description: "Mobile multiplayer road-trip game for Seattle to Oregon.",
+  manifest: "/manifest.json"
 };
 
 export const viewport = {
@@ -16,6 +17,12 @@ export default function RootLayout({ children }) {
   return (
     <html lang="en">
       <head>
+        <meta name="mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-title" content="Oregon or Bust" />
+        <link rel="manifest" href="/manifest.json" />
+        <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+        <link rel="apple-touch-icon" href="/icon.svg" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="" />
         <link

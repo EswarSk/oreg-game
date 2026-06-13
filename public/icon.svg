@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="108" fill="#0C211B"/>
+  <path d="M78 360c72-44 128 30 202-18 70-45 104 22 154-20v112H78z" fill="#2C6B52"/>
+  <path d="M72 382c76-34 138 26 210-8 72-36 110 18 158-18v88H72z" fill="#16463A"/>
+  <circle cx="384" cy="116" r="46" fill="#F2762E"/>
+  <path d="M239 82c-35 80 52 110 7 193-25 47 21 88 67 50 46-39 17-82 59-138 48-63-30-128-133-105z" fill="#2E8FA3"/>
+  <path d="M276 96c-25 66 42 88 8 154-18 36 17 60 48 35 28-23 12-62 45-100 34-42-12-87-101-89z" fill="#ECF4EE" opacity=".8"/>
+  <text x="256" y="244" text-anchor="middle" font-family="Arial Black, Impact, sans-serif" font-size="68" fill="#F7EDDC">OR</text>
+  <text x="256" y="306" text-anchor="middle" font-family="Arial Black, Impact, sans-serif" font-size="42" fill="#F2762E">BUST</text>
+</svg>

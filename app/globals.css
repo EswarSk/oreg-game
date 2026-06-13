@@ -1255,6 +1255,18 @@
       object-fit: cover;
       background: var(--sand);
     }
+    .photo-placeholder {
+      min-height: 180px;
+      display: grid;
+      place-items: center;
+      padding: 18px;
+      background:
+        linear-gradient(135deg, rgba(46,143,163,.18), rgba(247,237,220,.72)),
+        var(--sand);
+      color: var(--pine);
+      font-weight: 900;
+      text-align: center;
+    }
     .photo-body { padding: 12px; display: grid; gap: 9px; }
     .mission-tag { color: var(--falls); font-weight: 800; }
     .reactions {
