@@ -295,7 +295,12 @@ export default function Page() {
     const TRIP_WRAP_AT = new Date("2026-06-22T00:00:00-07:00").getTime();
     const TRIP_OPEN_LABEL = "June 20, 2026 at 12:00 AM PT";
     const APP_BUILD = process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA || process.env.NEXT_PUBLIC_APP_VERSION || "";
-    const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice", "join", "postLobbyComment", "copyDiagnostics"]);
+    const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice", "join", "postLobbyComment", "copyDiagnostics", "copySignals"]);
+    const PRODUCT_EVENT_KEY = "oob:product-events:v1";
+    const PRODUCT_EVENT_LIMIT = 220;
+    const PRODUCT_SESSION_KEY = "oob:product-session";
+    const PRODUCT_EVENT_QUEUE_KEY = "oob:product-event-queue:v1";
+    const PRODUCT_EVENT_QUEUE_LIMIT = 120;
     const LOCAL_TRIP_OPEN_AT = localTripOpenOverrideAt();
 
     const app = document.getElementById("app");
@@ -321,6 +326,7 @@ export default function Page() {
     let photosBootstrapped = false;
     let cacheWriteTimer = null;
     let queueFlushInProgress = false;
+    let productEventFlushInProgress = false;
 
     const LOCAL_DB_KEY = "oob:local-db";
     const LOCAL_MODE_KEY = "oob:local-mode";
@@ -380,6 +386,7 @@ export default function Page() {
       cacheRestored: false,
       cacheTs: 0,
       pendingActions: readQueuedActions().length,
+      pendingProductEvents: readQueuedProductEvents().length,
       spinning: false,
       spinningName: "",
       activityDot: false,
@@ -772,6 +779,7 @@ export default function Page() {
       }
       startCountdown();
       render();
+      trackProductEvent("session.opened", { surface: "local", hasName: Boolean(state.name), locked: tripLocked() });
     }
 
     function wrapRef(baseRef, constraints = []) {
@@ -883,6 +891,138 @@ export default function Page() {
       storageSet(ACTION_QUEUE_KEY, JSON.stringify(queue));
       state.pendingActions = queue.length;
       return queue;
+    }
+
+    function productSessionId() {
+      let sessionId = "";
+      try {
+        sessionId = sessionStorage.getItem(PRODUCT_SESSION_KEY) || "";
+        if (!sessionId) {
+          sessionId = `session_${Date.now()}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 18)}`;
+          sessionStorage.setItem(PRODUCT_SESSION_KEY, sessionId);
+        }
+      } catch {
+        sessionId = `session_${Date.now()}`;
+      }
+      return sessionId;
+    }
+
+    function storedProductEvents() {
+      const rows = safeJsonParse(storageGet(PRODUCT_EVENT_KEY) || "[]", []);
+      return Array.isArray(rows) ? rows.slice(-PRODUCT_EVENT_LIMIT) : [];
+    }
+
+    function writeStoredProductEvents(rows) {
+      storageSet(PRODUCT_EVENT_KEY, JSON.stringify((Array.isArray(rows) ? rows : []).slice(-PRODUCT_EVENT_LIMIT)));
+    }
+
+    function readQueuedProductEvents() {
+      const rows = safeJsonParse(storageGet(PRODUCT_EVENT_QUEUE_KEY) || "[]", []);
+      return Array.isArray(rows) ? rows.filter(item => item?.id && item?.event).slice(-PRODUCT_EVENT_QUEUE_LIMIT) : [];
+    }
+
+    function writeQueuedProductEvents(rows) {
+      const queue = Array.isArray(rows) ? rows.slice(-PRODUCT_EVENT_QUEUE_LIMIT) : [];
+      storageSet(PRODUCT_EVENT_QUEUE_KEY, JSON.stringify(queue));
+      state.pendingProductEvents = queue.length;
+      return queue;
+    }
+
+    function eventRouteContext() {
+      const stops = routeStops();
+      const progress = routeLevelProgress(ROUTE_KEY, stops);
+      return {
+        currentLevel: progress.currentStop?.level || 0,
+        currentStopId: progress.currentStop?.id || "",
+        currentStopName: progress.currentStop?.name || "",
+        completedLevels: progress.completedCount,
+        totalLevels: progress.total
+      };
+    }
+
+    function compactPayload(payload = {}) {
+      const out = {};
+      Object.entries(payload || {}).forEach(([key, value]) => {
+        if (value === undefined || typeof value === "function") return;
+        if (/dataUrl|base64|image|photoData|inviteCode|codeHash/i.test(key)) return;
+        if (typeof value === "string") out[key] = truncate(value, 180);
+        else if (typeof value === "number" || typeof value === "boolean" || value === null) out[key] = value;
+        else if (Array.isArray(value)) out[key] = value.slice(0, 12).map(item => typeof item === "string" ? truncate(item, 80) : item);
+        else if (typeof value === "object") out[key] = clone(value);
+      });
+      return out;
+    }
+
+    function productEventEntry(eventName, payload = {}) {
+      const eventPayload = compactPayload(payload);
+      return {
+        id: `evt_${Date.now()}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20)}`,
+        event: String(eventName || "unknown").slice(0, 80),
+        clientTs: Date.now(),
+        ts: new Date().toISOString(),
+        sessionId: productSessionId(),
+        appBuild: APP_BUILD || "",
+        name: state.name || "",
+        tab: state.tab || "",
+        mode: state.mode || "",
+        localMode,
+        tripLocked: tripLocked(),
+        online: navigator.onLine !== false,
+        connected: Boolean(state.connected),
+        ...eventRouteContext(),
+        payload: Object.keys(eventPayload).length ? eventPayload : { none: true }
+      };
+    }
+
+    async function sendRemoteProductEvent(entry) {
+      if (!entry) return false;
+      if (!localMode && (!firebaseApi || !db || !activeFirebaseUser() || navigator.onLine === false)) return false;
+      try {
+        await ref(`productEvents/${entry.id}`).set(entry);
+        return true;
+      } catch (error) {
+        if (!isRetryableSyncError(error)) recordError("product_event.remote_failed", error, { event: entry.event });
+        return false;
+      }
+    }
+
+    function queueProductEvent(entry) {
+      const queue = readQueuedProductEvents();
+      if (!queue.some(item => item.id === entry.id)) queue.push(entry);
+      writeQueuedProductEvents(queue);
+    }
+
+    async function drainProductEventQueue() {
+      if (productEventFlushInProgress || (!localMode && (!firebaseApi || !db || !activeFirebaseUser() || navigator.onLine === false))) return;
+      const queue = readQueuedProductEvents();
+      if (!queue.length) {
+        writeQueuedProductEvents([]);
+        return;
+      }
+      productEventFlushInProgress = true;
+      const remaining = [];
+      try {
+        for (const entry of queue) {
+          const sent = await sendRemoteProductEvent(entry);
+          if (!sent) {
+            remaining.push(entry, ...queue.slice(queue.indexOf(entry) + 1));
+            break;
+          }
+        }
+      } finally {
+        productEventFlushInProgress = false;
+        writeQueuedProductEvents(remaining);
+      }
+    }
+
+    function trackProductEvent(eventName, payload = {}) {
+      const entry = productEventEntry(eventName, payload);
+      writeStoredProductEvents([...storedProductEvents(), entry]);
+      if (!localMode && !entry.name) return entry;
+      sendRemoteProductEvent(entry).then(sent => {
+        if (!sent) queueProductEvent(entry);
+      });
+      return entry;
     }
 
     function enqueueAction(type, payload) {
@@ -1131,7 +1271,7 @@ export default function Page() {
           await ref(`feed/${payload.feedId || id()}`).set({
             ts: Number(payload.ts || Date.now()),
             name,
-            text: `🏁 ${name} cleared Level ${stop.level}: ${stop.name} (+15)`
+            text: `🏁 ${name} cleared Level ${stop.level}: ${stop.name}. ${levelClearText(stop)} (+15)`
           });
         }
         return;
@@ -1144,6 +1284,7 @@ export default function Page() {
           .filter(item => item !== emoji)
           .map(item => ref(`photos/${photoId}/reactions/${item}/${name}`).remove()));
         await ref(`photos/${photoId}/reactions/${emoji}/${name}`).set(true);
+        return;
       }
     }
 
@@ -1255,16 +1396,82 @@ export default function Page() {
       };
     }
 
+    function signalsExportEnabled() {
+      const params = new URLSearchParams(location.search);
+      return localMode || params.get("signals") === "1" || params.get("debug") === "1" || params.get("observe") === "1";
+    }
+
+    function publicPhotoSummary(photo) {
+      return {
+        id: photo.id,
+        name: photo.name,
+        missionId: photo.missionId,
+        missionTitle: photo.missionTitle,
+        pts: photo.pts,
+        ts: photo.ts || 0,
+        reactionCounts: reactionCounts(photo),
+        hasCaption: Boolean(photo.caption),
+        hasImage: Boolean(photo.dataUrl)
+      };
+    }
+
+    function gameSignalsBundle() {
+      const stops = routeStops();
+      const progress = routeLevelProgress(ROUTE_KEY, stops);
+      return {
+        app: "Oregon or Bust",
+        generatedAt: new Date().toISOString(),
+        purpose: "Share this with Codex/PM agents to analyze engagement loops and suggest product improvements.",
+        currentUser: {
+          name: state.name || "",
+          tab: state.tab,
+          score: Number(state.scores[state.name] || 0),
+          routeProgress: {
+            completed: progress.completedCount,
+            total: progress.total,
+            currentStop: progress.currentStop?.name || ""
+          }
+        },
+        crew: {
+          roster: state.roster,
+          scores: state.scores,
+          hype: state.hype,
+          sideAwards: sideAwards()
+        },
+        content: {
+          feed: state.feed.slice(0, 20),
+          lobbyMessages: state.lobbyMessages.slice(0, 20).map(item => ({ ...item, textLength: item.text?.length || 0, text: truncate(item.text, 80) })),
+          photos: state.photos.slice(0, 20).map(publicPhotoSummary),
+          missionClaims: state.missionClaims,
+          stopVotes: state.stopVotes
+        },
+        observability: {
+          localEvents: storedProductEvents(),
+          queuedEvents: readQueuedProductEvents(),
+          localDiagnostics: storedDiagnostics()
+        },
+        notes: [
+          "Photo image data is intentionally excluded.",
+          "Production-wide product events are written under productEvents in Firebase for export from the database console.",
+          "Use this bundle to ask agents: where are players dropping off, which mechanics create reactions, and what moments deserve more emphasis next?"
+        ]
+      };
+    }
+
+    function signalsButtonHtml() {
+      if (!signalsExportEnabled()) return "";
+      return `<button class="btn ghost debug-copy" data-action="copySignals">COPY GAME SIGNALS</button>`;
+    }
+
     function debugButtonHtml() {
       if (!state.hasDiagnostics) return "";
       return `<button class="btn ghost debug-copy" data-action="copyDiagnostics">COPY DEBUG LOG</button>`;
     }
 
-    async function copyDiagnostics() {
-      const text = JSON.stringify(diagnosticBundle(), null, 2);
+    async function copyTextToClipboard(text, successMessage, failEventName) {
       try {
         await navigator.clipboard.writeText(text);
-        toast("Debug log copied. Send it to Eswar.");
+        toast(successMessage);
       } catch (error) {
         try {
           const textarea = document.createElement("textarea");
@@ -1276,12 +1483,23 @@ export default function Page() {
           textarea.select();
           document.execCommand("copy");
           textarea.remove();
-          toast("Debug log copied. Send it to Eswar.");
+          toast(successMessage);
         } catch (copyError) {
-          recordError("diagnostics.copy_failed", copyError, { originalError: serializeError(error) });
-          toast("Could not copy debug log.");
+          recordError(failEventName, copyError, { originalError: serializeError(error) });
+          toast("Could not copy.");
         }
       }
+    }
+
+    async function copyDiagnostics() {
+      const text = JSON.stringify(diagnosticBundle(), null, 2);
+      await copyTextToClipboard(text, "Debug log copied. Send it to Eswar.", "diagnostics.copy_failed");
+    }
+
+    async function copySignals() {
+      const text = JSON.stringify(gameSignalsBundle(), null, 2);
+      trackProductEvent("signals.copied", { eventCount: storedProductEvents().length });
+      await copyTextToClipboard(text, "Game signals copied for agent review.", "signals.copy_failed");
     }
 
     function friendlyJoinError(error) {
@@ -1447,6 +1665,7 @@ export default function Page() {
         state.lobbyMessages = [optimistic, ...state.lobbyMessages.filter(item => item.id !== commentId)].slice(0, 50);
         state.lobbyDraft = "";
         enqueueAction("lobbyComment", { id: commentId, name: state.name, text, ts });
+        trackProductEvent("lobby.comment_queued", { textLength: text.length });
         toast("Comment saved. It will post when signal returns.");
         render();
         return;
@@ -1454,6 +1673,7 @@ export default function Page() {
       try {
         await ref(`lobbyMessages/${commentId}`).set({ name: state.name, text, ts });
         state.lobbyDraft = "";
+        trackProductEvent("lobby.comment_posted", { textLength: text.length });
         render();
         pruneLobbyMessages();
       } catch (error) {
@@ -1461,6 +1681,7 @@ export default function Page() {
           state.lobbyMessages = [optimistic, ...state.lobbyMessages.filter(item => item.id !== commentId)].slice(0, 50);
           state.lobbyDraft = "";
           enqueueAction("lobbyComment", { id: commentId, name: state.name, text, ts });
+          trackProductEvent("lobby.comment_queued", { textLength: text.length, retry: true });
           toast("Comment saved. It will retry when signal returns.");
           render();
           return;
@@ -1516,6 +1737,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             <p class="muted">Create a free Firebase project, enable Realtime Database in test mode, then add these values in Vercel or a local .env.local file.</p>
             <button class="btn falls" data-action="startLocal">START LOCAL TEST MODE</button>
             <button class="btn sand" data-action="seedLocal">ADD 15 TEST PLAYERS</button>
+            ${signalsButtonHtml()}
             ${debugButtonHtml()}
             <p class="muted mini" style="margin:0">Local test mode stores data in this browser and syncs across tabs on this machine. It is only for development.</p>
           </section>
@@ -1530,6 +1752,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             <h1 class="title">Loading Oregon or Bust</h1>
             <p>${escapeHtml(message)}</p>
             <p class="muted mini" style="margin:0">If this stays here, refresh once. If it still does not open, copy the debug log and send it to Eswar.</p>
+            ${signalsButtonHtml()}
             ${debugButtonHtml()}
           </section>
         </main>`;
@@ -1543,6 +1766,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             <h1 class="title">${escapeHtml(title)}</h1>
             <p>${escapeHtml(message)}</p>
             <button class="btn falls" onclick="location.reload()">RELOAD APP</button>
+            ${signalsButtonHtml()}
             ${debugButtonHtml()}
           </section>
         </main>`;
@@ -1642,6 +1866,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
               <button class="btn" data-action="postLobbyComment">POST COMMENT</button>
             </section>
             <p class="muted mini" style="margin:0">You are checked in. Points, cards, photos, route levels, and hot seat stay locked until trip day.</p>
+            ${signalsButtonHtml()}
             ${debugButtonHtml()}
           </section>
         </main>`;
@@ -1677,6 +1902,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
               <input id="inviteCodeInput" data-field="inviteCode" maxlength="32" autocomplete="one-time-code" placeholder="Private invite code" value="${escapeHtml(state.inviteCodeDraft)}">`}
               <button class="btn" data-action="join">${preTrip ? "JOIN LOBBY" : "LET'S RIDE +25"}</button>
             ` : `<div class="empty">Loading invite list...</div>`}
+            ${signalsButtonHtml()}
             ${debugButtonHtml()}
           </section>
         </main>`;
@@ -1708,6 +1934,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         <main class="screen stack">
           ${localMode ? `<div class="offline local-banner"><span>Local test mode${state.name ? ` - ${escapeHtml(state.name)}` : ""}</span><button data-action="seedLocal">Seed Demo</button><button data-action="switchLocal">Switch</button><button data-action="resetLocal">Reset</button></div>` : ""}
           ${syncNoticeHtml()}
+          ${signalsButtonHtml()}
           ${debugButtonHtml()}
           ${content}
         </main>
@@ -1778,6 +2005,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
               <span class="mono mini">${Number(state.scores[state.name] || 0)} pts</span>
             </div>
           </div>
+          ${gameDirectorHtml()}
           <section class="panel sand">
             <h2 class="section-title" data-countdown-title>${countdownTitle()}</h2>
             ${countdownHtml()}
@@ -2025,6 +2253,97 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       </div>`;
     }
 
+    function groupLevelStats(stop) {
+      const names = state.roster.length ? state.roster : Object.keys(state.scores || {});
+      const route = routeProgressRoot(ROUTE_KEY);
+      const players = route.players || {};
+      const completed = names.filter(name => players[name]?.completed?.[stop?.id]).length;
+      const active = names.filter(name => {
+        const player = players[name] || {};
+        const doneCount = (stop?.tasks || []).filter(task => player.tasks?.[stop.id]?.[task.id]).length;
+        return doneCount > 0 && !player.completed?.[stop.id];
+      }).length;
+      return { total: names.length || 1, completed, active };
+    }
+
+    function levelBonusText(stop) {
+      const name = String(stop?.name || "").toLowerCase();
+      if (name.includes("seattle")) return "Bonus: nominate the official trip anthem before the first mile.";
+      if (name.includes("multnomah")) return "Bonus: best mist-face photo gets a side-award nod.";
+      if (name.includes("timberline")) return "Bonus: pick the coziest lodge detail and make someone photograph it.";
+      if (name.includes("vista")) return "Bonus: one dramatic panorama pose, voted by reactions.";
+      if (name.includes("trillium")) return "Bonus: capture Mt. Hood energy in one frame.";
+      if (name.includes("silver")) return "Bonus: find the best behind-the-falls bragging line.";
+      if (name.includes("shopping")) return "Bonus: crown the weirdest tax-free purchase.";
+      if (name.includes("cannon")) return "Bonus: group pose with Haystack Rock or ocean proof.";
+      if (name.includes("astoria")) return "Bonus: make everyone name their favorite trip moment.";
+      return "Bonus: choose the photo or quote that should survive the group chat.";
+    }
+
+    function levelClearText(stop) {
+      const name = String(stop?.name || "this stop");
+      if (name.includes("Home")) return "Finish line cleared. The trip has receipts.";
+      if (name.includes("Beach")) return "Level cleared. You survived the coast and earned the brag.";
+      if (name.includes("Falls")) return "Level cleared. Mist proof accepted.";
+      if (name.includes("Shopping")) return "Level cleared. Oregon's no-sales-tax power has been used.";
+      return `Level cleared. ${name} is officially in your trip log.`;
+    }
+
+    function levelMoveText(stop) {
+      const name = String(stop?.name || "");
+      if (name.includes("Seattle")) return "Get everyone checked in and clear the roll-out checklist.";
+      if (name.includes("Falls")) return "Capture the stop proof, clear the checklist, and keep the route moving.";
+      if (name.includes("Lodge")) return "Lock in the arrival proof and confirm the crew is ready for the next leg.";
+      if (name.includes("Vista")) return "Grab the viewpoint moment and clear the next route task.";
+      if (name.includes("Kayak")) return "Finish the adventure proof before the crew moves on.";
+      if (name.includes("Beach")) return "Collect the coast moment and react to someone else's proof.";
+      if (name.includes("Shopping")) return "Clear the stop tasks and claim the best find.";
+      return `Clear the next checklist item, then react to someone else's proof.`;
+    }
+
+    function nextLevelTask(stop) {
+      const taskData = levelTaskData(stop?.id);
+      return (stop?.tasks || []).find(task => !taskData[task.id]) || null;
+    }
+
+    function gameDirectorHtml() {
+      const stops = routeStops();
+      const progress = routeLevelProgress(ROUTE_KEY, stops);
+      const stop = progress.currentStop || stops[0];
+      const taskCount = levelTaskCount(stop);
+      const nextTask = nextLevelTask(stop);
+      const group = groupLevelStats(stop);
+      const latest = state.feed[0];
+      const actionTab = nextTask ? "vote" : "missions";
+      const actionText = nextTask ? "OPEN CURRENT LEVEL" : "CLAIM PROOF PHOTO";
+      return `<section class="panel director-panel">
+        <div class="director-kicker">Now playing</div>
+        <div class="director-head">
+          <div>
+            <p class="mono mini muted">LEVEL ${stop.level} OF ${progress.total} · ${escapeHtml(levelStatusText(levelStatus(ROUTE_KEY, stop, progress), stop, progress))}</p>
+            <h2>${stop.icon} ${escapeHtml(stop.name)}</h2>
+          </div>
+          <span class="director-score">${taskCount.done}/${taskCount.total}</span>
+        </div>
+        <div class="director-move">
+          <span>🎮</span>
+          <div>
+            <strong>Your move</strong>
+            <p>${escapeHtml(nextTask ? nextTask.label : levelMoveText(stop))}</p>
+          </div>
+        </div>
+        <div class="director-grid">
+          <div><span class="mono">${group.completed}/${group.total}</span><small>crew cleared this level</small></div>
+          <div><span class="mono">${group.active}</span><small>people in progress</small></div>
+        </div>
+        <div class="director-live">
+          <strong>Live moment</strong>
+          <p>${latest ? escapeHtml(latest.text) : "No live moment yet. Make the first one."}</p>
+        </div>
+        <button class="btn" data-tab="${actionTab}">${actionText}</button>
+      </section>`;
+    }
+
     function levelControlHtml(stop, progress) {
       if (!stop) return "";
       const status = levelStatus(state.routeChoice, stop, progress);
@@ -2104,6 +2423,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const completed = completedLevelData(ROUTE_KEY, stop.id);
       const taskCount = levelTaskCount(stop);
       const taskReady = levelTasksDone(stop);
+      const group = groupLevelStats(stop);
       const buttonLabel = completed
         ? "REOPEN FROM HERE"
         : !taskReady
@@ -2124,6 +2444,17 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         </div>
         <p class="stop-signal">${escapeHtml(stop.note)}</p>
         ${completed ? `<p class="stop-signal">Cleared by <strong>you</strong>${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.</p>` : ""}
+        <div class="episode-stats">
+          <div><strong>${taskCount.done}/${taskCount.total}</strong><span>Your checklist</span></div>
+          <div><strong>${group.completed}/${group.total}</strong><span>Crew cleared</span></div>
+        </div>
+        <div class="episode-quest">
+          <span>✨</span>
+          <div>
+            <strong>${escapeHtml(levelBonusText(stop))}</strong>
+            <p>${escapeHtml(levelMoveText(stop))}</p>
+          </div>
+        </div>
         <div class="level-checklist">
           ${(stop.tasks || []).map(task => levelTaskHtml(stop, task, status, completed)).join("")}
         </div>
@@ -2444,18 +2775,83 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       </div>`;
     }
 
+    function cardPowerHint(card) {
+      const hints = {
+        "car-reset": "Play when cleanup starts. You sit out or supervise; everyone else handles reset.",
+        "dj": "Play before a drive leg. Your soundtrack rules until the next stop.",
+        "food": "Play before a food decision. You get final say.",
+        "snack": "Play during snack time. Snack debt becomes active immediately.",
+        "kara": "Play during a lull. One person owes the crew a chorus.",
+        "papar": "Play at any stop. Everyone has to pose now.",
+        "photo-director": "Play before a mission photo. You direct the scene.",
+        "shotgun": "Play before a drive leg. Front seat is yours.",
+        "navi": "Play before the route moves. You get one small detour.",
+        "navigator": "Play when people are debating directions. You own navigation.",
+        "memory": "Play before leaving a stop. Everyone shares one memory.",
+        "story": "Play during the drive. Someone owes the car a story."
+      };
+      return hints[card?.id] || "Play at the right moment. The crew has to honor the advantage.";
+    }
+
     function renderWildCard(card, index, reveal) {
       return `<article class="wild-card ${card.used ? "used" : ""}">
         <div class="emoji">${card.emoji}</div>
         <h3 class="bungee">${escapeHtml(card.name)}</h3>
         <p>${escapeHtml(card.desc)}</p>
+        <div class="power-hint"><strong>When to use</strong><span>${escapeHtml(cardPowerHint(card))}</span></div>
         ${card.used ? `<p class="mono mini">✅ used ${formatDateTime(card.usedAt)}</p>` : reveal ? "" : `<button class="btn" data-action="playCard" data-index="${index}" aria-label="Use ${escapeHtml(card.name)} card for 5 points">USE CARD (+5)</button>`}
       </article>`;
+    }
+
+    function topEntry(rows) {
+      return rows
+        .filter(([, value]) => Number(value) > 0)
+        .sort((a, b) => Number(b[1]) - Number(a[1]) || a[0].localeCompare(b[0]))[0] || null;
+    }
+
+    function photoCountsByOwner() {
+      const counts = {};
+      state.photos.forEach(photo => {
+        if (!photo?.name) return;
+        counts[photo.name] = (counts[photo.name] || 0) + 1;
+      });
+      return counts;
+    }
+
+    function reactionCountsByOwner() {
+      const counts = {};
+      state.photos.forEach(photo => {
+        if (!photo?.name) return;
+        const total = Object.values(reactionCounts(photo)).reduce((sum, count) => sum + count, 0);
+        counts[photo.name] = (counts[photo.name] || 0) + total;
+      });
+      return counts;
+    }
+
+    function routeCountsByPlayer() {
+      const players = routeProgressRoot(ROUTE_KEY).players || {};
+      return Object.fromEntries(Object.entries(players).map(([name, data]) => [name, Object.keys(data.completed || {}).length]));
+    }
+
+    function sideAwards() {
+      const leader = scoreRows()[0];
+      const hype = topEntry(Object.entries(state.hype.by || {}));
+      const photos = topEntry(Object.entries(photoCountsByOwner()));
+      const reactions = topEntry(Object.entries(reactionCountsByOwner()));
+      const route = topEntry(Object.entries(routeCountsByPlayer()));
+      return [
+        leader && { title: "Main Character", emoji: "🌟", name: leader[0], detail: `${Number(leader[1] || 0)} pts` },
+        route && { title: "Route Runner", emoji: "🗺️", name: route[0], detail: `${route[1]} levels cleared` },
+        photos && { title: "Photo MVP", emoji: "📸", name: photos[0], detail: `${photos[1]} wall posts` },
+        reactions && { title: "Reaction Magnet", emoji: "🔥", name: reactions[0], detail: `${reactions[1]} reactions earned` },
+        hype && { title: "Hype Captain", emoji: "⛽", name: hype[0], detail: `${hype[1]} pumps` }
+      ].filter(Boolean).slice(0, 6);
     }
 
     function ranksTab() {
       const rows = scoreRows();
       const leaderScore = Math.max(1, Number(rows[0]?.[1] || 1));
+      const awards = sideAwards();
       return `<div class="stack">
         <section class="panel sand">
           <h1 class="section-title">Leaderboard</h1>
@@ -2473,6 +2869,18 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
               <div class="rankbar"><span style="width:${pct}%"></span></div>
             </div>`;
           }).join("") : `<div class="empty">No scores yet. Impossible, but dramatic.</div>`}
+        </section>
+        <section class="panel awards-panel">
+          <h2 class="section-title">Side Awards</h2>
+          <p class="muted mini" style="margin-top:-6px">Points crown one winner. Awards make more stories.</p>
+          <div class="award-grid">
+            ${awards.length ? awards.map(award => `<div class="award-card">
+              <span>${award.emoji}</span>
+              <strong>${escapeHtml(award.title)}</strong>
+              <em>${escapeHtml(award.name)}</em>
+              <small>${escapeHtml(award.detail)}</small>
+            </div>`).join("") : `<div class="empty">Awards unlock as the crew plays.</div>`}
+          </div>
         </section>
       </div>`;
     }
@@ -2535,8 +2943,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         if (tripLocked()) {
           toast("You are checked into the lobby.");
           state.revealCards = null;
+          trackProductEvent("join.lobby", { name: clean, invitedNameCount: allowed.length });
         } else {
           await ensureGameEntry(clean, document.querySelector("[data-action='join']"));
+          trackProductEvent("join.trip", { name: clean, invitedNameCount: allowed.length });
         }
         render();
       } catch (error) {
@@ -2564,6 +2974,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         if (firstGameStart) {
           await addScore(name, 25, target);
           await pushFeed(`🚗 ${name} hopped in the car (+25)`, name);
+          trackProductEvent("game.started", { name, cardsDealt: Boolean(cards) });
           if (cards && name === state.name) state.revealCards = cards;
         }
       } catch (error) {
@@ -2667,6 +3078,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         const result = await ref(`hype/by/${state.name}`).transaction(value => (Number(value) || 0) + 1);
         const newCount = Number(result.snapshot.val() || 0);
         if (newCount <= 30) await addScore(state.name, 1, target);
+        trackProductEvent("hype.pumped", { personalCount: newCount, awardedPoint: newCount <= 30 });
       } catch (error) {
         toast("Pump did not sync.");
         console.warn(error);
@@ -2729,6 +3141,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           feedId: feedText ? `feed_stop_${ts}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20)}` : "",
           feedText
         });
+        trackProductEvent("route.stop_vote_queued", { stopId, vibe, previous: previous || "" });
         toast(`${vibeLabel} saved for retry.`);
         return;
       }
@@ -2736,6 +3149,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         await ref(`stopVotes/${route}/${stopId}/${state.name}`).set(vibe);
         toast(`${vibeLabel} marked.`);
         if (previous !== vibe) await pushFeed(`🗺️ ${state.name} marked ${stopName}: ${vibeLabel}`);
+        trackProductEvent("route.stop_voted", { stopId, stopName, vibe, previous: previous || "" });
         target?.classList.add("active");
       } catch (error) {
         if (isRetryableSyncError(error)) {
@@ -2749,6 +3163,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             feedId: feedText ? `feed_stop_${ts}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20)}` : "",
             feedText
           });
+          trackProductEvent("route.stop_vote_queued", { stopId, vibe, previous: previous || "", retry: true });
           toast(`${vibeLabel} saved. It will retry when signal returns.`);
           return;
         }
@@ -2798,6 +3213,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           checked: checkedNext,
           ts
         });
+        trackProductEvent("level.task_queued", { stopId, stopName: stop.name, taskId, checked: checkedNext });
         render();
         toast(checkedNext ? "Checklist saved for retry." : "Checklist clear saved for retry.");
         return;
@@ -2833,6 +3249,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         state.selectedStopId = stopId;
         setPlayerRouteProgress(ROUTE_KEY, state.name, result.snapshot.val() || {});
         render();
+        trackProductEvent("level.task_toggled", { stopId, stopName: stop.name, taskId, checked });
         toast(checked ? "Checklist item checked." : "Checklist item cleared.");
       } catch (error) {
         if (isRetryableSyncError(error)) {
@@ -2845,6 +3262,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             checked: checkedNext,
             ts
           });
+          trackProductEvent("level.task_queued", { stopId, stopName: stop.name, taskId, checked: checkedNext, retry: true });
           render();
           toast("Checklist saved. It will retry when signal returns.");
           return;
@@ -2892,6 +3310,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           ts: completionTs,
           feedId: `feed_complete_${completionTs}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20)}`
         });
+        trackProductEvent("level.complete_queued", { stopId: stop.id, stopName: stop.name, level: stop.level });
         render();
         toast(`Level ${nextStop.level === stop.level ? stop.level : nextStop.level} saved. Points sync when signal returns.`);
         return;
@@ -2922,7 +3341,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         state.selectedStopId = nextStop.id;
         render();
         await addScore(state.name, 15, target);
-        await pushFeed(`🏁 ${state.name} cleared Level ${stop.level}: ${stop.name} (+15)`, state.name);
+        await pushFeed(`🏁 ${state.name} cleared Level ${stop.level}: ${stop.name}. ${levelClearText(stop)} (+15)`, state.name);
+        trackProductEvent("level.completed", { stopId: stop.id, stopName: stop.name, level: stop.level });
         if (stop.level >= stops.length) {
           toast("All your route levels cleared!");
           burstConfetti();
@@ -2947,6 +3367,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             ts: completionTs,
             feedId: `feed_complete_${completionTs}_${id().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 20)}`
           });
+          trackProductEvent("level.complete_queued", { stopId: stop.id, stopName: stop.name, level: stop.level, retry: true });
           toast("Level saved. It will retry when signal returns.");
           render();
           return;
@@ -3024,6 +3445,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         if (result.committed) {
           await addScore(state.name, 5, target);
           await pushFeed(`🃏 ${state.name} used ${card.emoji} ${card.name.toUpperCase()}! ${card.desc} (+5)`);
+          trackProductEvent("card.played", { cardId: card.id, cardName: card.name });
         } else {
           toast("That card was already used.");
         }
@@ -3063,6 +3485,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         } else {
           await addScore(state.name, 3, target);
           await pushFeed(`🎯 ${state.name} spun the wheel - ${chosen} is in the HOT SEAT!`);
+          trackProductEvent("hotseat.spun", { target: chosen });
         }
       } catch (error) {
         toast("Spin did not sync.");
@@ -3093,10 +3516,12 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         if (status === "done") {
           await addScore(state.name, 25, target);
           await pushFeed(`🔥 ${state.name} SURVIVED the hot seat: "${dare.task}" (+25)`);
+          trackProductEvent("hotseat.resolved", { status, taskLength: String(dare.task || "").length });
           burstConfetti();
         } else {
           await addScore(state.name, -10, target);
           await pushFeed(`🐔 ${state.name} chickened out of the hot seat (-10)`);
+          trackProductEvent("hotseat.resolved", { status, taskLength: String(dare.task || "").length });
         }
       } catch (error) {
         toast("Dare did not resolve.");
@@ -3146,6 +3571,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       photoInput.value = "";
       clearTimeout(photoPromptTimer);
       toast(`Choose a photo for ${mission.title}.`);
+      trackProductEvent("mission.photo_picker_opened", { missionId, missionTitle: mission.title, pts: mission.pts });
       photoPromptTimer = setTimeout(() => {
         if (state.pendingMissionId === missionId) toast("No photo selected yet.");
       }, 1600);
@@ -3204,6 +3630,14 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         postedPhoto = true;
         await addScore(state.name, pts, document.querySelector(`[data-mission="${mission.id}"]`));
         await pushFeed(`📸 ${state.name} completed "${mission.title}" (+${pts})`);
+        trackProductEvent("mission.photo_posted", {
+          missionId: mission.id,
+          missionTitle: mission.title,
+          firstCompletion,
+          pts,
+          captionLength: caption.length,
+          compressedBytes: dataUrlBytes(dataUrl)
+        });
         state.optimisticPhotos = state.optimisticPhotos.filter(item => item.id !== tempId);
         render();
       } catch (error) {
@@ -3286,6 +3720,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         if (ownerDelta) await addScore(photo.name, ownerDelta);
         for (const reactor of reactors) await addScore(reactor, -2);
         await pushFeed(`🗑️ ${state.name} deleted a mission photo; points were adjusted.`);
+        trackProductEvent("mission.photo_deleted", { photoId, missionId: photo.missionId, pts: photo.pts, reactors: reactors.length });
         toast("Photo deleted.");
       } catch (error) {
         state.photos = priorPhotos;
@@ -3324,6 +3759,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           emoji,
           ts: reactionTs
         });
+        trackProductEvent("photo.reaction_queued", { photoId, emoji, owner: photo.name || "" });
         toast("Reaction saved for retry.");
         return;
       }
@@ -3340,6 +3776,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         if (firstReaction) {
           await pushFeed(`${state.name} reacted ${emoji} to ${photo.name || "someone"}'s photo`, state.name);
         }
+        trackProductEvent("photo.reacted", { photoId, emoji, owner: photo.name || "", firstReaction });
       } catch (error) {
         if (isRetryableSyncError(error)) {
           enqueueAction("reaction", {
@@ -3349,6 +3786,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
             emoji,
             ts: reactionTs
           });
+          trackProductEvent("photo.reaction_queued", { photoId, emoji, owner: photo.name || "", retry: true });
           toast("Reaction saved. It will retry when signal returns.");
           return;
         }
@@ -3365,7 +3803,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       ref(".info/connected").on("value", snap => {
         state.connected = snap.val() !== false;
         render();
-        if (state.connected) drainActionQueue();
+        if (state.connected) {
+          drainActionQueue();
+          drainProductEventQueue();
+        }
       });
       attachRosterListener();
       ref("scores").on("value", snap => {
@@ -3556,10 +3997,12 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       state.connected = true;
       render();
       drainActionQueue();
+      drainProductEventQueue();
     });
 
     window.addEventListener("offline", () => {
       state.connected = false;
+      trackProductEvent("connection.offline");
       render();
     });
 
@@ -3581,11 +4024,13 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const tab = event.target.closest("[data-tab]");
         if (tab) {
         if (state.confirmDialog) return;
+        const previousTab = state.tab;
         state.tab = tab.dataset.tab;
         if (state.tab === "home") state.activityDot = false;
         if (state.tab === "missions") state.photoDot = false;
         updateTabParam(state.tab);
         prepareActiveTab();
+        if (previousTab !== state.tab) trackProductEvent("nav.tab", { from: previousTab, to: state.tab });
         render();
         requestAnimationFrame(() => window.scrollTo(0, 0));
         return;
@@ -3605,12 +4050,13 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       if (action === "join") join();
       if (action === "postLobbyComment") postLobbyComment();
       if (action === "copyDiagnostics") copyDiagnostics();
+      if (action === "copySignals") copySignals();
       if (action === "finishReveal") { state.revealCards = null; render(); }
       if (action === "confirmChoice") { resolveConfirm(actionEl.dataset.choice); return; }
       if (action === "pump") pump(actionEl);
       if (action === "vote") vote(actionEl.dataset.choice, actionEl);
-      if (action === "routeToggle") { state.routeChoice = actionEl.dataset.choice; render(); }
-      if (action === "selectStop") { state.selectedStopId = actionEl.dataset.stop; render(); }
+      if (action === "routeToggle") { state.routeChoice = actionEl.dataset.choice; trackProductEvent("route.choice_viewed", { choice: state.routeChoice }); render(); }
+      if (action === "selectStop") { state.selectedStopId = actionEl.dataset.stop; trackProductEvent("route.stop_opened", { stopId: state.selectedStopId }); render(); }
       if (action === "stopVote") stopVote(actionEl.dataset.stop, actionEl.dataset.vibe, actionEl);
       if (action === "toggleLevelTask") toggleLevelTask(actionEl.dataset.stop, actionEl.dataset.task);
       if (action === "completeLevel") completeLevel(actionEl.dataset.stop, actionEl);
@@ -3799,6 +4245,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         }
         startCountdown();
         drainActionQueue();
+        drainProductEventQueue();
+        trackProductEvent("session.opened", { surface: "firebase", hasName: Boolean(state.name), locked: tripLocked() });
         safeRender();
       } catch (error) {
         recordError("boot.firebase_failed", error);

@@ -55,6 +55,15 @@
       }
     },
 
+    "productEvents": {
+      ".read": false,
+      ".indexOn": ["clientTs", "event", "name"],
+      "$id": {
+        ".write": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && !data.exists() && newData.exists() && newData.child('name').val() === root.child('players').child(auth.uid).child('name').val()",
+        ".validate": "newData.hasChildren(['event', 'clientTs', 'ts', 'sessionId', 'name', 'tab', 'payload']) && newData.child('event').isString() && newData.child('event').val().length > 0 && newData.child('event').val().length <= 80 && newData.child('clientTs').isNumber() && newData.child('ts').isString() && newData.child('ts').val().length > 0 && newData.child('ts').val().length <= 40 && newData.child('sessionId').isString() && newData.child('sessionId').val().length > 0 && newData.child('sessionId').val().length <= 80 && newData.child('name').isString() && newData.child('name').val().length > 0 && newData.child('name').val().length <= 24 && newData.child('tab').isString() && newData.child('tab').val().length <= 24"
+      }
+    },
+
     "gameStarts": {
       ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
       "$name": {
