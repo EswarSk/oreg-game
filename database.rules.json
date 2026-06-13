@@ -55,6 +55,28 @@
       }
     },
 
+    "lobby": {
+      ".read": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid",
+      "promptResponses": {
+        "$promptId": {
+          "$name": {
+            ".write": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name && !data.exists() && newData.exists()",
+            ".validate": "newData.hasChildren(['name', 'option', 'ts']) && newData.child('name').val() === $name && newData.child('option').isString() && newData.child('option').val().length > 0 && newData.child('option').val().length <= 32 && newData.child('ts').isNumber()"
+          }
+        }
+      },
+      "reactions": {
+        "$targetId": {
+          "$emoji": {
+            "$name": {
+              ".write": "auth != null && root.child('playerNames').child(root.child('players').child(auth.uid).child('name').val()).val() === auth.uid && root.child('players').child(auth.uid).child('name').val() === $name",
+              ".validate": "!newData.exists() || newData.val() === true"
+            }
+          }
+        }
+      }
+    },
+
     "productEvents": {
       ".read": false,
       ".indexOn": ["clientTs", "event", "name"],

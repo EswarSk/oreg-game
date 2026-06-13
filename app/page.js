@@ -289,13 +289,30 @@ export default function Page() {
       ["ranks", "🏆", "Ranks"]
     ];
     const REACTIONS = ["🔥", "😂", "❤️", "🤯"];
+    const LOBBY_PROMPT = {
+      id: "pretrip-anthem-v1",
+      question: "Pick the official first-drive vibe",
+      detail: "One answer each. This is just for lobby hype, not points.",
+      options: [
+        { id: "windows", emoji: "🎶", label: "Windows-down playlist" },
+        { id: "snacks", emoji: "🍿", label: "Snack run energy" },
+        { id: "views", emoji: "🌲", label: "Forest-road calm" },
+        { id: "chaos", emoji: "🎲", label: "Chaotic car karaoke" }
+      ]
+    };
+    const LOBBY_REACTIONS = ["🔥", "😂", "🎒"];
+    const LOBBY_TEASERS = [
+      { id: "route", emoji: "🗺️", title: "Route levels", detail: "10 stops unlock in order on trip day." },
+      { id: "cards", emoji: "🃏", title: "Wild cards", detail: "Secret advantages deal when the game opens." },
+      { id: "missions", emoji: "📸", title: "Photo missions", detail: "Proof photos stay locked until June 20." }
+    ];
     const AVATAR_COLORS = ["#16463A", "#2C6B52", "#2E8FA3", "#F2762E", "#B33A3A", "#735C2B", "#2E5B7D", "#7B3F58", "#35674C", "#1E4D59", "#8A4C25", "#5A6A36"];
     const TRIP_OPEN_AT = new Date("2026-06-20T00:00:00-07:00").getTime();
     const TRIP_DEPART_AT = new Date("2026-06-20T07:00:00-07:00").getTime();
     const TRIP_WRAP_AT = new Date("2026-06-22T00:00:00-07:00").getTime();
     const TRIP_OPEN_LABEL = "June 20, 2026 at 12:00 AM PT";
     const APP_BUILD = process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA || process.env.NEXT_PUBLIC_APP_VERSION || "";
-    const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice", "join", "postLobbyComment", "copyDiagnostics", "copySignals"]);
+    const PRE_TRIP_ALLOWED_ACTIONS = new Set(["startLocal", "seedLocal", "switchLocal", "resetLocal", "confirmChoice", "join", "postLobbyComment", "lobbyPromptVote", "lobbyReact", "copyDiagnostics", "copySignals"]);
     const PRODUCT_EVENT_KEY = "oob:product-events:v1";
     const PRODUCT_EVENT_LIMIT = 220;
     const PRODUCT_SESSION_KEY = "oob:product-session";
@@ -373,6 +390,8 @@ export default function Page() {
       routeProgress: {},
       feed: [],
       lobbyMessages: [],
+      lobbyPromptResponses: {},
+      lobbyReactions: {},
       lobbyDraft: "",
       hand: [],
       hotseat: null,
@@ -782,13 +801,15 @@ export default function Page() {
       trackProductEvent("session.opened", { surface: "local", hasName: Boolean(state.name), locked: tripLocked() });
     }
 
-    function wrapRef(baseRef, constraints = []) {
+    function wrapRef(baseRef, constraints = [], debugPath = "") {
       const targetRef = constraints.length ? firebaseApi.query(baseRef, ...constraints) : baseRef;
       let unsubscribe = null;
       return {
         on(eventName, callback) {
           if (eventName !== "value") throw new Error(`Unsupported Firebase event: ${eventName}`);
-          unsubscribe = firebaseApi.onValue(targetRef, callback);
+          unsubscribe = firebaseApi.onValue(targetRef, callback, error => {
+            recordError("firebase.listener_failed", error, { path: debugPath || "unknown" });
+          });
           return unsubscribe;
         },
         off() {
@@ -816,17 +837,17 @@ export default function Page() {
           return firebaseApi.remove(baseRef);
         },
         orderByChild(child) {
-          return wrapRef(baseRef, [...constraints, firebaseApi.orderByChild(child)]);
+          return wrapRef(baseRef, [...constraints, firebaseApi.orderByChild(child)], debugPath);
         },
         limitToLast(count) {
-          return wrapRef(baseRef, [...constraints, firebaseApi.limitToLast(count)]);
+          return wrapRef(baseRef, [...constraints, firebaseApi.limitToLast(count)], debugPath);
         }
       };
     }
 
     function ref(path) {
       if (localMode) return localRef(path);
-      return wrapRef(firebaseApi.ref(db, path));
+      return wrapRef(firebaseApi.ref(db, path), [], path);
     }
 
     function safeJsonParse(value, fallback) {
@@ -1086,6 +1107,8 @@ export default function Page() {
       state.routeProgress = safeObject(cache.routeProgress);
       state.feed = safeArray(cache.feed, 12);
       state.lobbyMessages = safeArray(cache.lobbyMessages, 50);
+      state.lobbyPromptResponses = safeObject(cache.lobbyPromptResponses);
+      state.lobbyReactions = safeObject(cache.lobbyReactions);
       state.hand = safeArray(cache.hand, 4);
       state.hotseat = cache.hotseat || null;
       state.history = safeArray(cache.history, 15);
@@ -1159,6 +1182,8 @@ export default function Page() {
         routeProgress: state.routeProgress,
         feed: state.feed.slice(0, 12),
         lobbyMessages: state.lobbyMessages.slice(0, 50),
+        lobbyPromptResponses: state.lobbyPromptResponses,
+        lobbyReactions: state.lobbyReactions,
         hand: state.hand.slice(0, 4),
         hotseat: state.hotseat,
         history: state.history.slice(0, 15),
@@ -1212,6 +1237,29 @@ export default function Page() {
         const text = String(payload.text || "").trim().slice(0, 120);
         if (!text) return;
         await ref(`lobbyMessages/${entry.id}`).set({ name, text, ts: Number(payload.ts || entry.ts || Date.now()) });
+        return;
+      }
+      if (entry.type === "lobbyPromptVote") {
+        const promptId = String(payload.promptId || LOBBY_PROMPT.id).slice(0, 60);
+        const option = String(payload.option || "");
+        if (!promptId || !LOBBY_PROMPT.options.some(item => item.id === option)) return;
+        await ref(`lobby/promptResponses/${promptId}/${name}`).transaction(current => current || {
+          name,
+          option,
+          ts: Number(payload.ts || entry.ts || Date.now())
+        });
+        return;
+      }
+      if (entry.type === "lobbyReaction") {
+        const targetId = String(payload.targetId || "").replace(/[.#$\[\]\/]/g, "").slice(0, 90);
+        const emoji = String(payload.emoji || "");
+        const selected = payload.selected !== false;
+        if (!targetId || !LOBBY_REACTIONS.includes(emoji)) return;
+        await Promise.all(LOBBY_REACTIONS
+          .filter(item => item !== emoji)
+          .map(item => ref(`lobby/reactions/${targetId}/${item}/${name}`).remove()));
+        if (selected) await ref(`lobby/reactions/${targetId}/${emoji}/${name}`).set(true);
+        else await ref(`lobby/reactions/${targetId}/${emoji}/${name}`).remove();
         return;
       }
       if (entry.type === "stopVote") {
@@ -1441,6 +1489,14 @@ export default function Page() {
         content: {
           feed: state.feed.slice(0, 20),
           lobbyMessages: state.lobbyMessages.slice(0, 20).map(item => ({ ...item, textLength: item.text?.length || 0, text: truncate(item.text, 80) })),
+          lobbyPrompt: {
+            id: LOBBY_PROMPT.id,
+            question: LOBBY_PROMPT.question,
+            responses: lobbyPromptResponses(),
+            counts: lobbyPromptOptionCounts()
+          },
+          lobbyHype: lobbyHypeStats(),
+          lobbyReactionCount: lobbyReactionTotal(),
           photos: state.photos.slice(0, 20).map(publicPhotoSummary),
           missionClaims: state.missionClaims,
           stopVotes: state.stopVotes
@@ -1533,6 +1589,97 @@ export default function Page() {
         .filter(message => message.text)
         .sort((a, b) => (b.ts || 0) - (a.ts || 0) || String(b.id).localeCompare(String(a.id)))
         .slice(0, 50);
+    }
+
+    function lobbyPromptResponseRows(snapshot) {
+      const responses = {};
+      snapshot.forEach(promptSnap => {
+        const promptId = String(promptSnap.key || "").slice(0, 60);
+        if (!promptId) return;
+        const promptResponses = {};
+        promptSnap.forEach(child => {
+          const value = child.val();
+          const name = sanitizeName(value?.name || child.key);
+          const option = String(value?.option || "");
+          if (!name || !LOBBY_PROMPT.options.some(item => item.id === option)) return;
+          promptResponses[name] = {
+            name,
+            option,
+            ts: Number(value?.ts || 0)
+          };
+        });
+        responses[promptId] = promptResponses;
+      });
+      return responses;
+    }
+
+    function lobbyReactionRows(snapshot) {
+      const rows = {};
+      snapshot.forEach(targetSnap => {
+        const targetId = String(targetSnap.key || "");
+        if (!targetId) return;
+        rows[targetId] = {};
+        targetSnap.forEach(emojiSnap => {
+          const emoji = String(emojiSnap.key || "");
+          if (!LOBBY_REACTIONS.includes(emoji)) return;
+          rows[targetId][emoji] = {};
+          emojiSnap.forEach(nameSnap => {
+            const name = sanitizeName(nameSnap.key);
+            if (name && nameSnap.val() === true) rows[targetId][emoji][name] = true;
+          });
+        });
+      });
+      return rows;
+    }
+
+    function lobbyCrewRows() {
+      const invited = invitedNameOptions();
+      const roster = new Set(state.roster);
+      const names = invited.length ? invited : state.roster;
+      return names.map(name => ({
+        name,
+        checked: roster.has(name) || name === state.name
+      })).sort((a, b) => Number(b.checked) - Number(a.checked) || a.name.localeCompare(b.name));
+    }
+
+    function lobbyPromptResponses() {
+      return safeObject(state.lobbyPromptResponses?.[LOBBY_PROMPT.id]);
+    }
+
+    function lobbyPromptResponseFor(name = state.name) {
+      return lobbyPromptResponses()[name] || null;
+    }
+
+    function lobbyPromptOptionCounts() {
+      const counts = Object.fromEntries(LOBBY_PROMPT.options.map(option => [option.id, 0]));
+      Object.values(lobbyPromptResponses()).forEach(response => {
+        if (counts[response.option] !== undefined) counts[response.option] += 1;
+      });
+      return counts;
+    }
+
+    function lobbyReactionCount(targetId, emoji) {
+      return Object.keys(state.lobbyReactions?.[targetId]?.[emoji] || {}).length;
+    }
+
+    function lobbyMyReaction(targetId) {
+      return LOBBY_REACTIONS.find(emoji => state.lobbyReactions?.[targetId]?.[emoji]?.[state.name]) || "";
+    }
+
+    function lobbyReactionTotal() {
+      return Object.values(state.lobbyReactions || {}).reduce((targetTotal, reactions) => (
+        targetTotal + LOBBY_REACTIONS.reduce((sum, emoji) => sum + Object.keys(reactions?.[emoji] || {}).length, 0)
+      ), 0);
+    }
+
+    function lobbyHypeStats() {
+      const crew = lobbyCrewRows();
+      const checked = crew.filter(member => member.checked).length || state.roster.length;
+      const responses = Object.keys(lobbyPromptResponses()).length;
+      const comments = state.lobbyMessages.length;
+      const reactions = lobbyReactionTotal();
+      const score = Math.min(100, checked * 7 + responses * 14 + comments * 8 + reactions * 4);
+      return { score, checked, invited: Math.max(crew.length, checked), responses, comments, reactions };
     }
 
     function toast(message) {
@@ -1692,6 +1839,81 @@ export default function Page() {
       }
     }
 
+    async function voteLobbyPrompt(option, target) {
+      if (!state.name) return toast("Join the lobby first.");
+      if (!LOBBY_PROMPT.options.some(item => item.id === option)) return;
+      if (lobbyPromptResponseFor()) return toast("Your lobby vote is already in.");
+      const ts = Date.now();
+      const response = { name: state.name, option, ts };
+      state.lobbyPromptResponses = {
+        ...state.lobbyPromptResponses,
+        [LOBBY_PROMPT.id]: {
+          ...lobbyPromptResponses(),
+          [state.name]: response
+        }
+      };
+      render();
+      trackProductEvent("lobby.prompt_voted", { promptId: LOBBY_PROMPT.id, option });
+      if (!canSyncNow()) {
+        enqueueAction("lobbyPromptVote", { id: `lobby_prompt_${LOBBY_PROMPT.id}_${state.name}`, name: state.name, promptId: LOBBY_PROMPT.id, option, ts });
+        toast("Lobby vote saved. It will sync when signal returns.");
+        return;
+      }
+      try {
+        const result = await ref(`lobby/promptResponses/${LOBBY_PROMPT.id}/${state.name}`).transaction(current => current || response);
+        if (!result.committed) toast("Your lobby vote was already saved.");
+      } catch (error) {
+        if (isRetryableSyncError(error)) {
+          enqueueAction("lobbyPromptVote", { id: `lobby_prompt_${LOBBY_PROMPT.id}_${state.name}`, name: state.name, promptId: LOBBY_PROMPT.id, option, ts });
+          toast("Lobby vote saved. It will retry when signal returns.");
+          return;
+        }
+        recordError("lobby.prompt_vote_failed", error, { promptId: LOBBY_PROMPT.id, option });
+        toast("Lobby vote did not sync.");
+        console.warn(error);
+      }
+    }
+
+    async function reactLobby(targetId, emoji) {
+      if (!state.name) return toast("Join the lobby first.");
+      targetId = String(targetId || "").replace(/[.#$\[\]\/]/g, "").slice(0, 90);
+      if (!targetId || !LOBBY_REACTIONS.includes(emoji)) return;
+      const selected = lobbyMyReaction(targetId) !== emoji;
+      const targetReactions = clone(state.lobbyReactions?.[targetId] || {});
+      LOBBY_REACTIONS.forEach(item => {
+        targetReactions[item] = { ...(targetReactions[item] || {}) };
+        delete targetReactions[item][state.name];
+      });
+      if (selected) targetReactions[emoji][state.name] = true;
+      state.lobbyReactions = {
+        ...state.lobbyReactions,
+        [targetId]: targetReactions
+      };
+      render();
+      trackProductEvent("lobby.reaction_added", { targetId, emoji, selected });
+      if (!canSyncNow()) {
+        enqueueAction("lobbyReaction", { id: `lobby_reaction_${targetId}_${state.name}`, name: state.name, targetId, emoji, selected, ts: Date.now() });
+        toast("Reaction saved for retry.");
+        return;
+      }
+      try {
+        await Promise.all(LOBBY_REACTIONS
+          .filter(item => item !== emoji)
+          .map(item => ref(`lobby/reactions/${targetId}/${item}/${state.name}`).remove()));
+        if (selected) await ref(`lobby/reactions/${targetId}/${emoji}/${state.name}`).set(true);
+        else await ref(`lobby/reactions/${targetId}/${emoji}/${state.name}`).remove();
+      } catch (error) {
+        if (isRetryableSyncError(error)) {
+          enqueueAction("lobbyReaction", { id: `lobby_reaction_${targetId}_${state.name}`, name: state.name, targetId, emoji, selected, ts: Date.now() });
+          toast("Reaction saved. It will retry when signal returns.");
+          return;
+        }
+        recordError("lobby.reaction_failed", error, { targetId, emoji, selected });
+        toast("Reaction did not sync.");
+        console.warn(error);
+      }
+    }
+
     async function pruneLobbyMessages() {
       try {
         const snap = await ref("lobbyMessages").orderByChild("ts").once("value");
@@ -1812,59 +2034,165 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       renderApp();
     }
 
+    function lobbyBoardingHtml() {
+      const crew = lobbyCrewRows();
+      const checked = crew.filter(member => member.checked).length;
+      const total = Math.max(crew.length, checked);
+      return `<section class="panel boarding-panel" style="box-shadow:none">
+        <div class="between">
+          <div>
+            <h2 class="section-title" style="margin:0">Crew Boarding</h2>
+            <p class="muted mini" style="margin:4px 0 0">${checked}/${total || checked || 1} checked in</p>
+          </div>
+          <span class="boarding-count">${checked}</span>
+        </div>
+        <div class="boarding-list" aria-live="polite">
+          ${crew.length ? crew.map(member => `<div class="boarding-row ${member.checked ? "checked" : "waiting"}">
+            ${avatar(member.name)}
+            <div>
+              <strong>${escapeHtml(member.name)}${member.name === state.name ? " (you)" : ""}</strong>
+              <span>${member.checked ? "Checked in" : "Not boarded yet"}</span>
+            </div>
+            <em>${member.checked ? "READY" : "WAIT"}</em>
+          </div>`).join("") : `<div class="empty">You are first to board.</div>`}
+        </div>
+      </section>`;
+    }
+
+    function lobbyHypeHtml() {
+      const hype = lobbyHypeStats();
+      return `<section class="panel lobby-hype-panel" style="box-shadow:none">
+        <div class="between">
+          <div>
+            <h2 class="section-title" style="margin:0">Pre-Trip Hype</h2>
+            <p class="muted mini" style="margin:4px 0 0">Cosmetic only. No points, no unlocks.</p>
+          </div>
+          <span class="mono">${hype.score}%</span>
+        </div>
+        <div class="lobby-hype-bar" aria-label="Pre-trip hype ${hype.score}%"><span style="width:${hype.score}%"></span></div>
+        <div class="hype-stats">
+          <span>${hype.checked} boarded</span>
+          <span>${hype.responses} votes</span>
+          <span>${hype.comments} comments</span>
+          <span>${hype.reactions} reacts</span>
+        </div>
+      </section>`;
+    }
+
+    function lobbyPromptHtml() {
+      const mine = lobbyPromptResponseFor();
+      const counts = lobbyPromptOptionCounts();
+      const total = Math.max(1, Object.values(counts).reduce((sum, count) => sum + count, 0));
+      return `<section class="panel prompt-panel" style="box-shadow:none">
+        <div>
+          <h2 class="section-title" style="margin:0">Today's Hype Prompt</h2>
+          <p class="muted mini" style="margin:5px 0 0">${escapeHtml(LOBBY_PROMPT.detail)}</p>
+        </div>
+        <h3>${escapeHtml(LOBBY_PROMPT.question)}</h3>
+        <div class="prompt-options ${mine ? "answered" : ""}">
+          ${LOBBY_PROMPT.options.map(option => {
+            const count = counts[option.id] || 0;
+            const pct = Math.round(count / total * 100);
+            const active = mine?.option === option.id;
+            return `<button class="prompt-option ${active ? "active" : ""}" data-action="lobbyPromptVote" data-option="${escapeHtml(option.id)}" ${mine ? "disabled" : ""}>
+              <span>${option.emoji}</span>
+              <strong>${escapeHtml(option.label)}</strong>
+              ${mine ? `<small>${count} vote${count === 1 ? "" : "s"}</small><i style="width:${pct}%"></i>` : ""}
+            </button>`;
+          }).join("")}
+        </div>
+        ${mine ? `<p class="muted mini" style="margin:0">Your vote is in. Results update as the crew answers.</p>` : ""}
+      </section>`;
+    }
+
+    function lobbyCommentHtml(message) {
+      const mine = lobbyMyReaction(message.id);
+      return `<div class="feed-row lobby-message">
+        ${avatar(message.name)}
+        <div>
+          <div class="lobby-message-head">
+            <strong>${escapeHtml(message.name)}</strong>
+            <time class="mono mini muted">${formatTime(message.ts)}</time>
+          </div>
+          <p>${escapeHtml(message.text)}</p>
+          <div class="lobby-reacts" aria-label="React to ${escapeHtml(message.name)} comment">
+            ${LOBBY_REACTIONS.map(emoji => {
+              const count = lobbyReactionCount(message.id, emoji);
+              return `<button class="${mine === emoji ? "active" : ""}" data-action="lobbyReact" data-target="${escapeHtml(message.id)}" data-emoji="${escapeHtml(emoji)}">${emoji}${count ? ` <span>${count}</span>` : ""}</button>`;
+            }).join("")}
+          </div>
+        </div>
+      </div>`;
+    }
+
+    function lobbyChatHtml() {
+      return `<section class="panel" style="box-shadow:none">
+        <div class="between">
+          <h2 class="section-title" style="margin:0">Lobby Comments</h2>
+          <span class="mono mini">${state.lobbyMessages.length}</span>
+        </div>
+        <div class="lobby-comment-meta">
+          <span>Newest first</span>
+          ${state.lobbyMessages.length > 5 ? `<span>Scroll for older</span>` : ""}
+        </div>
+        <div class="lobby-messages" aria-live="polite" tabindex="0">
+          ${state.lobbyMessages.length ? state.lobbyMessages.map(lobbyCommentHtml).join("") : `<div class="empty">No comments yet. Drop the first road-trip thought.</div>`}
+        </div>
+        <label class="field-label" for="lobbyCommentInput">Comment</label>
+        <input id="lobbyCommentInput" data-field="lobbyDraft" maxlength="120" autocomplete="off" placeholder="Hype, snack requests, arrival plans..." value="${escapeHtml(state.lobbyDraft)}">
+        <button class="btn" data-action="postLobbyComment">POST COMMENT</button>
+      </section>`;
+    }
+
+    function lobbyTeasersHtml() {
+      return `<section class="panel locked-teasers" style="box-shadow:none">
+        <div>
+          <h2 class="section-title" style="margin:0">Locked Until Trip Day</h2>
+          <p class="muted mini" style="margin:4px 0 0">Previews only. These cannot change trip state before June 20.</p>
+        </div>
+        <div class="teaser-grid">
+          ${LOBBY_TEASERS.map(teaser => `<div class="teaser-card">
+            <span>${teaser.emoji}</span>
+            <strong>${escapeHtml(teaser.title)}</strong>
+            <p>${escapeHtml(teaser.detail)}</p>
+            <em>LOCKED</em>
+          </div>`).join("")}
+        </div>
+      </section>`;
+    }
+
     function renderLobby() {
-      const joined = state.roster.length ? state.roster : [state.name].filter(Boolean);
       app.innerHTML = `
-        <main class="join lobby">
-          <div class="logo" style="margin:auto">OREGON<span>OR BUST</span><small>Seattle -> Oregon</small></div>
+        <main class="join lobby boarding-lobby">
           <section class="join-card stack lobby-card">
             ${syncNoticeHtml()}
-            <div class="between">
-              <div>
-                <h1 class="title">Lobby</h1>
-                <p class="muted">Game actions unlock ${tripOpenLabel()}.</p>
+            <section class="boarding-pass">
+              <div class="boarding-pass-top">
+                <div>
+                  <span class="boarding-kicker">Boarding Pass</span>
+                  <h1>Oregon or Bust</h1>
+                  <p>Seattle -> Oregon</p>
+                </div>
+                <div class="lobby-you">${avatar(state.name)}<span>${escapeHtml(state.name)}</span></div>
               </div>
-              <div class="lobby-you">${avatar(state.name)}<span>${escapeHtml(state.name)}</span></div>
-            </div>
-            <div class="lobby-road" aria-hidden="true">
-              <span>Seattle</span>
-              <i></i>
-              <strong>Oregon</strong>
-            </div>
-            <section class="panel sand" style="box-shadow:none">
-              <h2 class="section-title" data-countdown-title>Unlock Countdown</h2>
-              ${countdownHtml(tripOpenAt())}
-            </section>
-            <section class="panel" style="box-shadow:none">
-              <div class="between">
-                <h2 class="section-title" style="margin:0">Checked In</h2>
-                <span class="mono mini">${joined.length}</span>
+              <div class="lobby-road" aria-hidden="true">
+                <span>Seattle</span>
+                <i></i>
+                <strong>Oregon</strong>
               </div>
-              <div class="avatar-cloud">
-                ${joined.map(name => `<div class="lobby-avatar">${avatar(name)}<span>${escapeHtml(name)}${name === state.name ? " (you)" : ""}</span></div>`).join("")}
+              <div class="boarding-countdown">
+                <div>
+                  <strong data-countdown-title>Trip Unlocks</strong>
+                  <span>${tripOpenLabel()}</span>
+                </div>
+                ${countdownHtml(tripOpenAt())}
               </div>
             </section>
-            <section class="panel" style="box-shadow:none">
-              <div class="between">
-                <h2 class="section-title" style="margin:0">Lobby Comments</h2>
-                <span class="mono mini">${state.lobbyMessages.length}</span>
-              </div>
-              <div class="lobby-comment-meta">
-                <span>Newest first</span>
-                ${state.lobbyMessages.length > 5 ? `<span>Scroll for older</span>` : ""}
-              </div>
-              <div class="lobby-messages" aria-live="polite" tabindex="0">
-                ${state.lobbyMessages.length ? state.lobbyMessages.map(message => `
-                  <div class="feed-row">
-                    ${avatar(message.name)}
-                    <div><strong>${escapeHtml(message.name)}</strong><br>${escapeHtml(message.text)}</div>
-                    <time class="mono mini muted">${formatTime(message.ts)}</time>
-                  </div>`).join("") : `<div class="empty">No comments yet. Drop the first road-trip thought.</div>`}
-              </div>
-              <label class="field-label" for="lobbyCommentInput">Comment</label>
-              <input id="lobbyCommentInput" data-field="lobbyDraft" maxlength="120" autocomplete="off" placeholder="Hype, snack requests, arrival plans..." value="${escapeHtml(state.lobbyDraft)}">
-              <button class="btn" data-action="postLobbyComment">POST COMMENT</button>
-            </section>
+            ${lobbyBoardingHtml()}
+            ${lobbyHypeHtml()}
+            ${lobbyPromptHtml()}
+            ${lobbyChatHtml()}
+            ${lobbyTeasersHtml()}
             <p class="muted mini" style="margin:0">You are checked in. Points, cards, photos, route levels, and hot seat stay locked until trip day.</p>
             ${signalsButtonHtml()}
             ${debugButtonHtml()}
@@ -3891,6 +4219,14 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         state.loaded.lobby = true;
         render();
       });
+      ref("lobby/promptResponses").on("value", snap => {
+        state.lobbyPromptResponses = lobbyPromptResponseRows(snap);
+        render();
+      });
+      ref("lobby/reactions").on("value", snap => {
+        state.lobbyReactions = lobbyReactionRows(snap);
+        render();
+      });
     }
 
     function attachInviteListener() {
@@ -4049,6 +4385,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       if (action === "resetLocal") resetLocalGame();
       if (action === "join") join();
       if (action === "postLobbyComment") postLobbyComment();
+      if (action === "lobbyPromptVote") voteLobbyPrompt(actionEl.dataset.option, actionEl);
+      if (action === "lobbyReact") reactLobby(actionEl.dataset.target, actionEl.dataset.emoji);
       if (action === "copyDiagnostics") copyDiagnostics();
       if (action === "copySignals") copySignals();
       if (action === "finishReveal") { state.revealCards = null; render(); }
