@@ -302,7 +302,7 @@ export default function Page() {
     };
     const LOBBY_REACTIONS = ["🔥", "😂", "🎒"];
     const LOBBY_TEASERS = [
-      { id: "route", emoji: "🗺️", title: "Route levels", detail: "10 stops unlock in order on trip day." },
+      { id: "route", emoji: "🗺️", title: "Route levels", detail: "10 itinerary stops can be cleared in whatever order the trip happens." },
       { id: "cards", emoji: "🃏", title: "Wild cards", detail: "Secret advantages deal when the game opens." },
       { id: "missions", emoji: "📸", title: "Photo missions", detail: "Proof photos stay locked until June 20." }
     ];
@@ -1278,15 +1278,21 @@ export default function Page() {
         const taskId = payload.taskId || "";
         const checked = Boolean(payload.checked);
         if (!stopId || !taskId) return;
+        const stops = routeStops();
+        const stop = stops.find(item => item.id === stopId);
+        const task = stop?.tasks?.find(item => item.id === taskId);
+        if (!stop || !task) return;
         await ref(`routeProgress/${ROUTE_KEY}/players/${name}`).transaction(current => {
           current = current || {};
-          if (current.completed?.[stopId]) return current;
+          const completed = completedLevelsFromRaw(current.completed || {});
+          if (!canPlayRouteStop({ ...current, completed }, stop)) return;
           const tasks = current.tasks || {};
           const stopTasks = { ...(tasks[stopId] || {}) };
           if (checked) stopTasks[taskId] = { by: name, ts: Number(payload.ts || Date.now()) };
           else delete stopTasks[taskId];
           return {
             ...current,
+            completed,
             tasks: {
               ...tasks,
               [stopId]: stopTasks
@@ -1297,15 +1303,16 @@ export default function Page() {
       }
       if (entry.type === "completeLevel") {
         const stopId = payload.stopId || "";
-        const stop = routeStops().find(item => item.id === stopId);
+        const stops = routeStops();
+        const stop = stops.find(item => item.id === stopId);
         if (!stop) return;
         const stamp = { by: name, ts: Number(payload.ts || Date.now()), queueId: entry.id };
-        let shouldAward = false;
-        await ref(`routeProgress/${ROUTE_KEY}/players/${name}`).transaction(current => {
+        const result = await ref(`routeProgress/${ROUTE_KEY}/players/${name}`).transaction(current => {
           current = current || {};
-          const completed = current.completed || {};
-          if (completed[stop.id]) return current;
-          shouldAward = true;
+          const completed = completedLevelsFromRaw(current.completed || {});
+          if (completed[stop.id]) return;
+          if (!canPlayRouteStop({ ...current, completed }, stop)) return;
+          if (!tasksCompleteForStop(current, stop)) return;
           return {
             ...current,
             completed: {
@@ -1314,7 +1321,8 @@ export default function Page() {
             }
           };
         });
-        if (shouldAward) {
+        const savedStamp = result.snapshot.val()?.completed?.[stop.id] || {};
+        if (result.committed && savedStamp.queueId === entry.id) {
           await ref(`scores/${name}`).transaction(value => (Number(value) || 0) + 15);
           await ref(`feed/${payload.feedId || id()}`).set({
             ts: Number(payload.ts || Date.now()),
@@ -1845,6 +1853,7 @@ export default function Page() {
       if (lobbyPromptResponseFor()) return toast("Your lobby vote is already in.");
       const ts = Date.now();
       const response = { name: state.name, option, ts };
+      const previousPromptResponses = clone(state.lobbyPromptResponses);
       state.lobbyPromptResponses = {
         ...state.lobbyPromptResponses,
         [LOBBY_PROMPT.id]: {
@@ -1868,6 +1877,8 @@ export default function Page() {
           toast("Lobby vote saved. It will retry when signal returns.");
           return;
         }
+        state.lobbyPromptResponses = previousPromptResponses || {};
+        render();
         recordError("lobby.prompt_vote_failed", error, { promptId: LOBBY_PROMPT.id, option });
         toast("Lobby vote did not sync.");
         console.warn(error);
@@ -1879,6 +1890,7 @@ export default function Page() {
       targetId = String(targetId || "").replace(/[.#$\[\]\/]/g, "").slice(0, 90);
       if (!targetId || !LOBBY_REACTIONS.includes(emoji)) return;
       const selected = lobbyMyReaction(targetId) !== emoji;
+      const previousReactions = clone(state.lobbyReactions);
       const targetReactions = clone(state.lobbyReactions?.[targetId] || {});
       LOBBY_REACTIONS.forEach(item => {
         targetReactions[item] = { ...(targetReactions[item] || {}) };
@@ -1908,6 +1920,8 @@ export default function Page() {
           toast("Reaction saved. It will retry when signal returns.");
           return;
         }
+        state.lobbyReactions = previousReactions || {};
+        render();
         recordError("lobby.reaction_failed", error, { targetId, emoji, selected });
         toast("Reaction did not sync.");
         console.warn(error);
@@ -2498,6 +2512,28 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       return routeProgressRoot(choice)?.players?.[name] || {};
     }
 
+    function completedLevelsFromRaw(rawCompleted) {
+      return safeObject(rawCompleted);
+    }
+
+    function canPlayRouteStop(current, stop) {
+      return Boolean(stop && !current?.completed?.[stop.id]);
+    }
+
+    function tasksCompleteForStop(current, stop) {
+      if (!stop?.tasks?.length) return false;
+      const stopTasks = current?.tasks?.[stop.id] || {};
+      return stop.tasks.every(task => stopTasks[task.id]);
+    }
+
+    function nextOpenStopAfter(stops, stop, completed) {
+      if (!stops?.length) return stop;
+      const index = Math.max(0, stops.findIndex(item => item.id === stop?.id));
+      return stops.slice(index + 1).find(item => !completed?.[item.id])
+        || stops.find(item => !completed?.[item.id])
+        || stop;
+    }
+
     function setPlayerRouteProgress(choice, name, progress) {
       const route = routeProgressRoot(choice);
       state.routeProgress = {
@@ -2512,8 +2548,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       };
     }
 
-    function completedLevels(choice) {
-      return playerRouteProgress(choice).completed || {};
+    function completedLevels(choice, stops = routeStops(choice), name = state.name) {
+      return completedLevelsFromRaw(playerRouteProgress(choice, name).completed || {});
     }
 
     function completedLevelData(choice, stopId) {
@@ -2536,7 +2572,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     }
 
     function routeLevelProgress(choice, stops = routeStops(choice)) {
-      const completed = completedLevels(choice);
+      const completed = completedLevels(choice, stops);
       const completedCount = stops.filter(stop => completed[stop.id]).length;
       const firstOpen = stops.findIndex(stop => !completed[stop.id]);
       const allDone = stops.length > 0 && firstOpen === -1;
@@ -2558,15 +2594,13 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function levelStatus(choice, stop, progress) {
       if (completedLevelData(choice, stop.id)) return "complete";
-      if (!progress.allDone && stop.level - 1 === progress.currentIndex) return "current";
-      if (!progress.allDone && stop.level - 1 > progress.currentIndex) return "locked";
       return "open";
     }
 
     function levelProgressLabel(progress) {
       if (!progress.total) return "No levels loaded";
       if (progress.allDone) return `All ${progress.total} of your levels cleared`;
-      return `Level ${progress.currentIndex + 1} of ${progress.total}: ${progress.currentStop?.name || "Next stop"}`;
+      return `${progress.total - progress.completedCount} stops still open. Clear them in the order the trip actually happens.`;
     }
 
     function levelProgressHtml(progress) {
@@ -2643,7 +2677,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const group = groupLevelStats(stop);
       const latest = state.feed[0];
       const actionTab = nextTask ? "vote" : "missions";
-      const actionText = nextTask ? "OPEN CURRENT LEVEL" : "CLAIM PROOF PHOTO";
+      const actionText = nextTask ? "OPEN ROUTE LEVELS" : "CLAIM PROOF PHOTO";
       return `<section class="panel director-panel">
         <div class="director-kicker">Now playing</div>
         <div class="director-head">
@@ -2678,12 +2712,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const completed = completedLevelData(state.routeChoice, stop.id);
       const action = completed
         ? `<button class="btn small ghost" data-action="reopenLevel" data-stop="${escapeHtml(stop.id)}">REOPEN</button>`
-        : status === "current"
-          ? `<button class="btn small" data-action="completeLevel" data-stop="${escapeHtml(stop.id)}">COMPLETE</button>`
-          : `<button class="btn small ghost" disabled>${status === "locked" ? "LOCKED" : "WAIT"}</button>`;
+        : `<button class="btn small" data-action="completeLevel" data-stop="${escapeHtml(stop.id)}">COMPLETE</button>`;
       return `<div class="level-control ${status}">
         <div>
-          <span class="mono mini">${status === "current" ? "Active level" : status === "complete" ? "Cleared level" : "Selected level"}</span>
+          <span class="mono mini">${status === "complete" ? "Cleared level" : "Playable level"}</span>
           <strong>${stop.icon} Level ${stop.level}: ${escapeHtml(stop.name)}</strong>
         </div>
         ${action}
@@ -2692,14 +2724,11 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function routeLevelMapHtml(stops, selected, progress) {
       const path = "M31 8 C73 17 18 25 66 38 C92 48 14 55 35 69 C55 82 75 80 36 91 C28 94 43 97 62 96";
-      const progressStops = progress.allDone ? stops : stops.slice(0, Math.max(1, progress.currentIndex + 1));
-      const progressPath = progressStops.length > 1 ? partialRoutePath(progressStops.length) : "";
       return `<div class="level-map" role="group" aria-label="Oregon route levels">
         <svg class="level-map-bg" viewBox="0 0 100 104" preserveAspectRatio="none" aria-hidden="true">
           <rect width="100" height="104" rx="7" fill="#102A22"/>
           <path d="${path}" fill="none" stroke="#7A4F2B" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
           <path d="${path}" fill="none" stroke="#F7EDDC" stroke-width="1.7" stroke-linecap="round" stroke-dasharray="2.2 4.2"/>
-          ${progressPath ? `<path d="${progressPath}" fill="none" stroke="#F2762E" stroke-width="5.2" stroke-linecap="round" stroke-linejoin="round"/>` : ""}
           <circle cx="86" cy="22" r="12" fill="#2E8FA3" opacity=".72"/>
           <path d="M5 91 C18 86 30 91 42 86 C54 81 66 89 96 80 L96 104 L5 104 Z" fill="#F7EDDC" opacity=".11"/>
           <path d="M75 6 L82 20 L67 20 Z M83 18 L92 35 L74 35 Z M70 25 L78 42 L60 42 Z" fill="#2C6B52" opacity=".78"/>
@@ -2733,7 +2762,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const side = stop.x > 50 ? "left" : "right";
       const labelX = stop.x + (side === "left" ? -8 : 8);
       const labelAlign = side === "left" ? "right" : "left";
-      const mark = completed ? "✓" : status === "locked" ? "🔒" : stop.level;
+      const mark = completed ? "✓" : stop.level;
       return `<button class="level-node ${status} ${active ? "active" : ""}" style="left:${stop.x}%;top:${stop.y}%;" data-action="selectStop" data-stop="${escapeHtml(stop.id)}" aria-label="Level ${stop.level}: ${escapeHtml(stop.name)}">
           <span class="level-node-mark">${mark}</span>
           <span class="level-node-icon">${stop.icon}</span>
@@ -2759,12 +2788,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           : `COMPLETE LEVEL ${stop.level}`;
       const action = completed
         ? `<button class="btn ghost level-action" data-action="reopenLevel" data-stop="${escapeHtml(stop.id)}">${buttonLabel}</button>`
-        : status === "current"
-          ? `<button class="btn level-action" data-action="completeLevel" data-stop="${escapeHtml(stop.id)}" ${taskReady ? "" : "disabled"}>${buttonLabel}</button>`
-          : `<button class="btn ghost level-action" disabled>${status === "locked" ? `CLEAR LEVEL ${progress.currentIndex + 1} FIRST` : "WAITING"}</button>`;
+        : `<button class="btn level-action" data-action="completeLevel" data-stop="${escapeHtml(stop.id)}" ${taskReady ? "" : "disabled"}>${buttonLabel}</button>`;
       return `<section class="panel sand level-detail ${status}">
         <div class="level-detail-head">
-          <span class="stop-badge ${status}">${completed ? "✓" : status === "locked" ? "🔒" : stop.level}</span>
+          <span class="stop-badge ${status}">${completed ? "✓" : stop.level}</span>
           <div>
             <p class="mono mini muted">LEVEL ${stop.level} OF ${progress.total} · DAY ${stop.day} · ${escapeHtml(levelStatusText(status, stop, progress))}</p>
             <h2 class="section-title">${stop.icon} ${escapeHtml(stop.name)}</h2>
@@ -2841,8 +2868,6 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function routeMapHtml(choice, stops, selected, progress) {
       const points = stops.map(stop => `${stop.x},${stop.y}`).join(" ");
-      const progressStops = progress.allDone ? stops : stops.slice(0, Math.max(1, progress.currentIndex + 1));
-      const progressPoints = progressStops.map(stop => `${stop.x},${stop.y}`).join(" ");
       return `<div class="route-board" role="group" aria-label="${escapeHtml(OPTIONS[choice].name)} ordered route map">
         <svg class="route-map-art" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
           <rect width="100" height="100" fill="#ECF4EE"/>
@@ -2854,7 +2879,6 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           <path d="M74 2 C69 14 82 20 76 34 C70 49 82 55 78 69 C74 82 84 89 80 100" fill="none" stroke="#F7EDDC" stroke-width="3" opacity=".65"/>
           <polyline points="${points}" fill="none" stroke="#0C211B" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
           <polyline points="${points}" fill="none" stroke="#F7EDDC" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="2 3"/>
-          ${progressStops.length > 1 ? `<polyline points="${progressPoints}" fill="none" stroke="#F2762E" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>` : ""}
           <text x="9" y="9" font-family="Bungee" font-size="7" fill="#16463A">WA</text>
           <text x="9" y="95" font-family="Bungee" font-size="7" fill="#16463A">OR</text>
           <text x="71" y="94" font-family="Space Mono" font-size="4.2" fill="#0C211B">PACIFIC</text>
@@ -2867,7 +2891,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         ${stops.map(stop => {
           const active = selected?.id === stop.id;
           const status = levelStatus(choice, stop, progress);
-          const mark = status === "complete" ? "✓" : status === "locked" ? "🔒" : stop.level;
+          const mark = status === "complete" ? "✓" : stop.level;
           const voted = Boolean(stopVoteData(choice, stop.id)[state.name]);
           return `<button class="path-node ${status} ${active ? "active" : ""} ${voted ? "voted" : ""}" style="left:${stop.x}%;top:${stop.y}%;" data-action="selectStop" data-stop="${escapeHtml(stop.id)}" aria-label="${escapeHtml(stop.name)}">
             <span class="node-disc">${mark}</span>
@@ -2888,19 +2912,17 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const status = levelStatus(state.routeChoice, stop, progress);
       const action = completed
         ? `<button class="btn small ghost" data-action="reopenLevel" data-stop="${escapeHtml(stop.id)}">REOPEN</button>`
-        : status === "current"
-          ? `<button class="btn small" data-action="completeLevel" data-stop="${escapeHtml(stop.id)}">COMPLETE</button>`
-          : `<button class="btn small ghost" disabled>${status === "locked" ? "LOCKED" : "WAIT"}</button>`;
+        : `<button class="btn small" data-action="completeLevel" data-stop="${escapeHtml(stop.id)}">COMPLETE</button>`;
       return `<div class="map-detail-tray ${status}">
         <div class="tray-head">
-          <span class="tray-level">${status === "complete" ? "✓" : status === "locked" ? "🔒" : stop.level}</span>
+          <span class="tray-level">${status === "complete" ? "✓" : stop.level}</span>
           <div>
             <p class="mono mini">Level ${stop.level} · Day ${stop.day} · ${escapeHtml(levelStatusText(status, stop, progress))}</p>
             <h3>${stop.icon} ${escapeHtml(stop.name)}</h3>
           </div>
           ${action}
         </div>
-        <p>${completed ? `Cleared by you${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.` : status === "current" ? "Your active stop. Clear it to unlock your next level." : "Peek ahead and vote, but your route unlocks in order."}</p>
+        <p>${completed ? `Cleared by you${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.` : "Clear this stop when the crew actually does it. You can do stops in any order."}</p>
         <div class="tray-signal">
           <span>${winner ? `${winner.emoji} ${escapeHtml(winner.label)}` : "Crew signal open"}</span>
           <span class="mono">${total} vote${total === 1 ? "" : "s"}</span>
@@ -2916,8 +2938,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
     function levelStatusText(status, stop, progress) {
       if (status === "complete") return "Cleared";
       if (status === "current") return "Now";
-      if (status === "locked") return `Clear L${progress.currentIndex + 1} first`;
-      return `L${stop.level}`;
+      if (status === "locked") return "Locked";
+      return "Playable";
     }
 
     function levelCaption(stop) {
@@ -2943,18 +2965,16 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const status = levelStatus(state.routeChoice, stop, progress);
       const action = completed
         ? `<button class="btn ghost level-action" data-action="reopenLevel" data-stop="${escapeHtml(stop.id)}">REOPEN FROM HERE</button>`
-        : status === "current"
-          ? `<button class="btn level-action" data-action="completeLevel" data-stop="${escapeHtml(stop.id)}">MARK LEVEL ${stop.level} COMPLETE</button>`
-          : `<button class="btn ghost level-action" disabled>${status === "locked" ? `CLEAR LEVEL ${progress.currentIndex + 1} FIRST` : "WAITING ON PRIOR LEVEL"}</button>`;
+        : `<button class="btn level-action" data-action="completeLevel" data-stop="${escapeHtml(stop.id)}">MARK LEVEL ${stop.level} COMPLETE</button>`;
       return `<section class="panel sand stop-detail">
         <div class="between stop-detail-head">
           <div>
             <p class="mono mini muted">LEVEL ${stop.level} OF ${progress.total} · DAY ${stop.day} · OPTION ${state.routeChoice}</p>
             <h2 class="section-title">${stop.icon} ${escapeHtml(stop.name)}</h2>
           </div>
-          <span class="stop-badge ${status}">${status === "complete" ? "✓" : status === "locked" ? "🔒" : stop.level}</span>
+          <span class="stop-badge ${status}">${status === "complete" ? "✓" : stop.level}</span>
         </div>
-        <p class="stop-signal">${completed ? `Cleared by <strong>you</strong>${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.` : status === "current" ? "Your active level. Clear this stop to unlock your next place." : "Plan ahead here, but complete your itinerary in order."}</p>
+        <p class="stop-signal">${completed ? `Cleared by <strong>you</strong>${completed.ts ? ` at ${formatTime(completed.ts)}` : ""}.` : "Clear this level when the real trip reaches it. Itinerary order is a guide, not a gate."}</p>
         ${action}
         <p class="stop-signal">${winner ? `${winner.emoji} Crew signal: <strong>${escapeHtml(winner.label)}</strong>` : "First read is wide open."}</p>
         <div class="vibe-grid">
@@ -3508,18 +3528,22 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function applyLocalLevelTask(stopId, taskId, checked, ts = Date.now()) {
       const current = playerRouteProgress(ROUTE_KEY, state.name);
+      const completed = completedLevelsFromRaw(current.completed || {});
+      if (completed[stopId]) return false;
       const tasks = { ...(current.tasks || {}) };
       const stopTasks = { ...(tasks[stopId] || {}) };
       if (checked) stopTasks[taskId] = { by: state.name, ts };
       else delete stopTasks[taskId];
       setPlayerRouteProgress(ROUTE_KEY, state.name, {
         ...current,
+        completed,
         tasks: {
           ...tasks,
           [stopId]: stopTasks
         }
       });
       state.selectedStopId = stopId;
+      return true;
     }
 
     async function toggleLevelTask(stopId, taskId) {
@@ -3529,10 +3553,13 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const stop = stops.find(item => item.id === stopId);
       const task = stop?.tasks?.find(item => item.id === taskId);
       if (!stop || !task) return;
+      const progress = routeLevelProgress(ROUTE_KEY, stops);
+      if (progress.allDone) return toast("All your route levels are already complete.");
+      if (completedLevelData(ROUTE_KEY, stop.id)) return toast("That level is already complete.");
       const checkedNext = !Boolean(levelTaskData(stopId)[taskId]);
       const ts = Date.now();
       if (!canSyncNow()) {
-        applyLocalLevelTask(stopId, taskId, checkedNext, ts);
+        if (!applyLocalLevelTask(stopId, taskId, checkedNext, ts)) return toast("That level is already complete.");
         enqueueAction("levelTask", {
           id: `task_${ROUTE_KEY}_${stopId}_${taskId}_${state.name}`,
           name: state.name,
@@ -3550,11 +3577,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       try {
         const result = await ref(`routeProgress/${ROUTE_KEY}/players/${state.name}`).transaction(current => {
           current = current || {};
-          const completed = current.completed || {};
-          if (completed[stop.id]) return;
-          const firstOpen = stops.findIndex(item => !completed[item.id]);
-          const currentIndex = firstOpen === -1 ? stops.length - 1 : Math.max(0, firstOpen);
-          if (stop.level - 1 > currentIndex) return;
+          const completed = completedLevelsFromRaw(current.completed || {});
+          if (!canPlayRouteStop({ ...current, completed }, stop)) return;
 
           const tasks = current.tasks || {};
           const stopTasks = { ...(tasks[stopId] || {}) };
@@ -3567,13 +3591,14 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           }
           return {
             ...current,
+            completed,
             tasks: {
               ...tasks,
               [stopId]: stopTasks
             }
           };
         });
-        if (!result.committed) return toast("That checklist is locked right now.");
+        if (!result.committed) return toast("That checklist is already closed.");
         state.selectedStopId = stopId;
         setPlayerRouteProgress(ROUTE_KEY, state.name, result.snapshot.val() || {});
         render();
@@ -3581,7 +3606,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         toast(checked ? "Checklist item checked." : "Checklist item cleared.");
       } catch (error) {
         if (isRetryableSyncError(error)) {
-          applyLocalLevelTask(stopId, taskId, checkedNext, ts);
+          if (!applyLocalLevelTask(stopId, taskId, checkedNext, ts)) return toast("That level is already complete.");
           enqueueAction("levelTask", {
             id: `task_${ROUTE_KEY}_${stopId}_${taskId}_${state.name}`,
             name: state.name,
@@ -3610,9 +3635,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const stop = stops.find(item => item.id === stopId);
       if (!stop) return;
       if (progress.allDone) return toast("All your route levels are already complete.");
-      if (progress.currentStop?.id !== stop.id) {
-        return toast(`Level ${progress.currentIndex + 1} is up next.`);
-      }
+      if (completedLevelData(route, stop.id)) return toast("That level is already complete.");
       if (!levelTasksDone(stop)) {
         return toast("Finish the level checklist first.");
       }
@@ -3620,15 +3643,16 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const completionTs = Date.now();
       const queueId = `complete_${route}_${stop.id}_${state.name}_${completionTs}`;
       const stamp = { by: state.name, ts: completionTs, queueId };
-      const nextStop = stops[stop.level] || stop;
 
       if (!canSyncNow()) {
+        const completed = {
+          ...completedLevels(route),
+          [stop.id]: stamp
+        };
+        const nextStop = nextOpenStopAfter(stops, stop, completed);
         setPlayerRouteProgress(route, state.name, {
           ...playerRouteProgress(route, state.name),
-          completed: {
-            ...completedLevels(route),
-            [stop.id]: stamp
-          }
+          completed
         });
         state.selectedStopId = nextStop.id;
         enqueueAction("completeLevel", {
@@ -3640,19 +3664,17 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         });
         trackProductEvent("level.complete_queued", { stopId: stop.id, stopName: stop.name, level: stop.level });
         render();
-        toast(`Level ${nextStop.level === stop.level ? stop.level : nextStop.level} saved. Points sync when signal returns.`);
+        toast(`Level ${stop.level} saved. Points sync when signal returns.`);
         return;
       }
 
       try {
         const result = await ref(`routeProgress/${route}/players/${state.name}`).transaction(current => {
           current = current || {};
-          const completed = current.completed || {};
+          const completed = completedLevelsFromRaw(current.completed || {});
           if (completed[stop.id]) return;
-          const firstOpen = stops.findIndex(item => !completed[item.id]);
-          if (firstOpen === -1 || stops[firstOpen]?.id !== stop.id) return;
-          const stopTasks = current.tasks?.[stop.id] || {};
-          if (!stop.tasks.every(item => stopTasks[item.id])) return;
+          if (!canPlayRouteStop({ ...current, completed }, stop)) return;
+          if (!tasksCompleteForStop(current, stop)) return;
           return {
             ...current,
             completed: {
@@ -3665,27 +3687,31 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           toast("Your level state changed. Check the current level and tasks.");
           return;
         }
-        setPlayerRouteProgress(route, state.name, result.snapshot.val() || {});
+        const savedProgress = result.snapshot.val() || {};
+        setPlayerRouteProgress(route, state.name, savedProgress);
+        const nextStop = nextOpenStopAfter(stops, stop, savedProgress.completed || {});
         state.selectedStopId = nextStop.id;
         render();
         await addScore(state.name, 15, target);
         await pushFeed(`🏁 ${state.name} cleared Level ${stop.level}: ${stop.name}. ${levelClearText(stop)} (+15)`, state.name);
         trackProductEvent("level.completed", { stopId: stop.id, stopName: stop.name, level: stop.level });
-        if (stop.level >= stops.length) {
+        if (stops.every(item => savedProgress.completed?.[item.id])) {
           toast("All your route levels cleared!");
           burstConfetti();
         } else {
-          toast(`Your Level ${nextStop.level} unlocked.`);
+          toast(`Level ${stop.level} cleared. Pick whichever stop comes next.`);
         }
         target?.classList.add("active");
       } catch (error) {
         if (isRetryableSyncError(error)) {
+          const completed = {
+            ...completedLevels(route),
+            [stop.id]: stamp
+          };
+          const nextStop = nextOpenStopAfter(stops, stop, completed);
           setPlayerRouteProgress(route, state.name, {
             ...playerRouteProgress(route, state.name),
-            completed: {
-              ...completedLevels(route),
-              [stop.id]: stamp
-            }
+            completed
           });
           state.selectedStopId = nextStop.id;
           enqueueAction("completeLevel", {
