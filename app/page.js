@@ -59,10 +59,60 @@ export default function Page() {
       "Order in a cowboy voice at the next food stop",
       "Let the group choose your next snack - you must finish it",
       "Perform a 30-second dramatic monologue about Oregon",
-      "Text your mom \"I joined a folk band\" and show the reply",
+      "Draft a fake text that says \"I joined a folk band\" and read it dramatically",
       "Do a dance at the next scenic viewpoint",
       "Recite your phone number backwards in one try",
-      "Trade one wild card with the person on your left (if you have one)"
+      "Trade one wild card with the person on your left (if you have one)",
+      "Invent a fake Oregon town name and explain its entire backstory",
+      "Give the next landmark a movie-trailer voiceover",
+      "Let the group rename you until the next stop",
+      "Do a 20-second weather report for the car",
+      "Start a round of two truths and a lie about road trips",
+      "Compliment the driver like they are a Formula 1 champion",
+      "Choose one car object and make a dramatic sales pitch for it",
+      "Make up a short chant for the next destination",
+      "Tell a story using exactly five words from the group",
+      "Let the group pick your next photo pose",
+      "Give everyone in the car a fake award title",
+      "Speak only in questions for the next 3 minutes",
+      "Create a new nickname for everyone in the car",
+      "Do your best tour-guide intro for the current stop",
+      "Make a serious apology to a snack for eating it",
+      "Ask the group one surprisingly deep question",
+      "Make up a conspiracy theory about the itinerary",
+      "Do a slow clap for the next scenic view",
+      "Choose the official car mascot from something visible nearby",
+      "Give a one-minute TED Talk about gas station snacks",
+      "Let someone else choose a harmless dare for you",
+      "Say the next sentence like a dramatic soap opera character",
+      "Invent a slogan for Oregon or Bust",
+      "Do a fake restaurant review of the last thing you ate",
+      "Pick the next group selfie expression",
+      "Declare one person the MVP of the last hour and explain why",
+      "Describe the current mood using only movie titles",
+      "Hum a song and make the group guess it",
+      "Make a prediction about the trip that must be checked later",
+      "Give a motivational speech to the car",
+      "Do a 15-second silent movie scene at the next stop",
+      "Let the group choose one word you must use five times",
+      "Name three things you are grateful for on this trip",
+      "Invent a fake law that applies only inside this car",
+      "Create a handshake with the person next to you",
+      "Tell the group your most controversial snack opinion",
+      "Describe someone in the car as if they are a video game character",
+      "Make up a haiku about the last stop",
+      "Choose a theme song for one person in the car",
+      "Speak like a sports commentator for the next safe parking maneuver",
+      "Give a museum-style description of a random item in the car",
+      "Create the official trip motto",
+      "Ask the group to vote on your best and worst road-trip trait",
+      "Do a fake breaking-news report about the trip",
+      "Start a mini awards ceremony for the last photo posted",
+      "Give the next bridge, waterfall, or beach a celebrity name",
+      "Tell a one-minute story that includes Oregon, a sandwich, and a mystery",
+      "Make everyone choose their current trip power-up",
+      "Do your best impression of the GPS voice",
+      "Pick someone to be your hype person for the next photo"
     ];
 
     const MISSIONS = [
@@ -341,6 +391,7 @@ export default function Page() {
     let feedBootstrapped = false;
     const seenFeedIds = new Set();
     let photosBootstrapped = false;
+    let claimedPhotoHydrationInProgress = false;
     let cacheWriteTimer = null;
     let queueFlushInProgress = false;
     let productEventFlushInProgress = false;
@@ -355,8 +406,8 @@ export default function Page() {
     const STATE_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
     const ACTION_QUEUE_KEY = "oob:action-queue:v1";
     const ACTION_QUEUE_LIMIT = 80;
-    const PHOTO_INITIAL_LIMIT = 8;
-    const PHOTO_LOAD_STEP = 8;
+    const PHOTO_INITIAL_LIMIT = 24;
+    const PHOTO_LOAD_STEP = 24;
     const PHOTO_CACHE_LIMIT = 3;
     const PHOTO_CACHE_MAX_BYTES = 180 * 1024;
     const LOCAL_LISTENERS = new Set();
@@ -398,6 +449,7 @@ export default function Page() {
       history: [],
       photos: [],
       optimisticPhotos: [],
+      missingPhotoClaims: [],
       missionClaims: {},
       photoLimit: PHOTO_INITIAL_LIMIT,
       confirmDialog: null,
@@ -1389,6 +1441,9 @@ export default function Page() {
         loaded: { ...state.loaded },
         rosterCount: state.roster.length,
         lobbyMessageCount: state.lobbyMessages.length,
+        photoCount: state.photos.length,
+        optimisticPhotoCount: state.optimisticPhotos.length,
+        photoLimit: state.photoLimit,
         online: navigator.onLine,
         userAgent: navigator.userAgent,
         ...extra
@@ -2989,6 +3044,8 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function missionsTab() {
       const photos = [...state.optimisticPhotos, ...state.photos].sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      const canLoadMore = state.photos.length >= state.photoLimit;
+      const loadMoreButton = canLoadMore ? `<button class="btn sand wall-load" data-action="loadPhotos">Load ${PHOTO_LOAD_STEP} more</button>` : "";
       return `<div class="stack">
         <section class="panel sand tight">
           <h1 class="section-title">Photo Missions</h1>
@@ -2997,9 +3054,16 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           ${MISSIONS.map(mission => missionRow(mission)).join("")}
         </section>
         <section class="tight">
-          <h2 class="section-title">The Wall</h2>
+          <div class="wall-head">
+            <div>
+              <h2 class="section-title">The Wall</h2>
+              <p class="muted mini">Showing latest ${state.photos.length}${canLoadMore ? ". Older posts may be available." : "."}</p>
+            </div>
+            ${loadMoreButton}
+          </div>
+          ${missingPhotoClaimsHtml()}
           ${photos.length ? photos.map(photoCard).join("") : `<div class="panel"><div class="empty">No photos yet - the first legendary moment is up for grabs.</div></div>`}
-          ${state.photos.length >= state.photoLimit ? `<button class="btn sand" data-action="loadPhotos">Load ${PHOTO_LOAD_STEP} more</button>` : ""}
+          ${loadMoreButton}
         </section>
       </div>`;
     }
@@ -3014,6 +3078,53 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         </span>
         <span class="mission-side"><span class="pts">+${mission.pts}</span><span class="upload-chip" aria-label="Choose photo">📷</span><span class="upload-text">Photo</span></span>
       </button>`;
+    }
+
+    function claimKey(claim) {
+      return `${claim.missionId}:${claim.name}:${claim.photoId}`;
+    }
+
+    function claimedPhotoEntries() {
+      const entries = [];
+      Object.entries(state.missionClaims || {}).forEach(([missionId, claims]) => {
+        Object.entries(safeObject(claims)).forEach(([name, claim]) => {
+          const photoId = claim && typeof claim === "object" ? String(claim.photoId || "") : "";
+          if (!photoId) return;
+          const mission = MISSIONS.find(item => item.id === missionId);
+          entries.push({
+            missionId,
+            missionTitle: mission?.title || missionId,
+            name,
+            photoId,
+            ts: Number(claim.ts || 0)
+          });
+        });
+      });
+      return entries;
+    }
+
+    function photoMatchesClaim(photo, claim) {
+      return Boolean(photo && claim && (photo.id === claim.photoId || (photo.missionId === claim.missionId && photo.name === claim.name)));
+    }
+
+    function knownPhotos() {
+      return [...state.optimisticPhotos, ...state.photos];
+    }
+
+    function visibleMissingPhotoClaims() {
+      const photos = knownPhotos();
+      return state.missingPhotoClaims.filter(claim => !photos.some(photo => photoMatchesClaim(photo, claim)));
+    }
+
+    function missingPhotoClaimsHtml() {
+      const missing = visibleMissingPhotoClaims();
+      if (!missing.length) return "";
+      const names = missing.slice(0, 6).map(item => `${item.name} - ${item.missionTitle}`);
+      return `<div class="panel wall-warning">
+        <strong>${missing.length} claimed photo${missing.length === 1 ? "" : "s"} missing from the wall</strong>
+        <p class="muted mini">Mission completion exists, but the photo record was not found. Re-upload from the original phone if it should appear here.</p>
+        <p class="mini">${escapeHtml(names.join(", "))}${missing.length > names.length ? "..." : ""}</p>
+      </div>`;
     }
 
     function photoCard(photo) {
@@ -3048,6 +3159,50 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
     function reactionNames(photo) {
       return [...new Set(REACTIONS.flatMap(emoji => Object.keys(photo.reactions?.[emoji] || {})))];
+    }
+
+    function mergePhotos(rows) {
+      const byId = new Map();
+      [...state.photos, ...rows].forEach(photo => {
+        if (photo?.id) byId.set(photo.id, photo);
+      });
+      state.photos = [...byId.values()].sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      const photos = knownPhotos();
+      state.missingPhotoClaims = state.missingPhotoClaims.filter(claim => !photos.some(photo => photoMatchesClaim(photo, claim)));
+    }
+
+    function addMissingPhotoClaims(rows) {
+      const byKey = new Map(state.missingPhotoClaims.map(item => [claimKey(item), item]));
+      rows.forEach(item => byKey.set(claimKey(item), item));
+      state.missingPhotoClaims = [...byKey.values()].sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    }
+
+    async function hydrateClaimedPhotos() {
+      if (claimedPhotoHydrationInProgress || !state.loaded.claims || !state.loaded.photos) return;
+      const existingPhotos = knownPhotos();
+      const missingKeys = new Set(state.missingPhotoClaims.map(claimKey));
+      const entries = claimedPhotoEntries().filter(entry =>
+        !existingPhotos.some(photo => photoMatchesClaim(photo, entry)) &&
+        !missingKeys.has(claimKey(entry))
+      );
+      if (!entries.length) return;
+      claimedPhotoHydrationInProgress = true;
+      const recovered = [];
+      const missing = [];
+      try {
+        for (const entry of entries.slice(0, 60)) {
+          const snap = await ref(`photos/${entry.photoId}`).once("value");
+          if (snap.exists()) recovered.push({ id: snap.key || entry.photoId, ...snap.val() });
+          else missing.push(entry);
+        }
+        if (recovered.length) mergePhotos(recovered);
+        if (missing.length) addMissingPhotoClaims(missing);
+        if (recovered.length || missing.length) render();
+      } catch (error) {
+        recordError("mission.claimed_photo_hydration_failed", error, { checked: entries.length });
+      } finally {
+        claimedPhotoHydrationInProgress = false;
+      }
     }
 
     function hotseatTab() {
@@ -3950,7 +4105,9 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       const claimPath = `missionClaims/${mission.id}/${state.name}`;
       let wroteClaim = false;
       let postedPhoto = false;
+      let photoStage = "start";
       try {
+        photoStage = "compress";
         toast("Compressing photo...");
         const dataUrl = await compressImage(file);
         const caption = state.caption.trim().slice(0, 80);
@@ -3964,6 +4121,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
 
         let firstCompletion = false;
         const claimValue = { photoId, ts: Date.now() };
+        photoStage = "claim";
         const claim = await ref(claimPath).transaction(current => {
           firstCompletion = !current;
           return current || claimValue;
@@ -3980,10 +4138,11 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           ts: Date.now(),
           reactions: {}
         };
+        photoStage = "photo";
         await ref(`photos/${photoId}`).set(photo);
         postedPhoto = true;
-        await addScore(state.name, pts, document.querySelector(`[data-mission="${mission.id}"]`));
-        await pushFeed(`📸 ${state.name} completed "${mission.title}" (+${pts})`);
+        state.optimisticPhotos = state.optimisticPhotos.filter(item => item.id !== tempId);
+        render();
         trackProductEvent("mission.photo_posted", {
           missionId: mission.id,
           missionTitle: mission.title,
@@ -3992,11 +4151,19 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
           captionLength: caption.length,
           compressedBytes: dataUrlBytes(dataUrl)
         });
-        state.optimisticPhotos = state.optimisticPhotos.filter(item => item.id !== tempId);
-        render();
+        await addScore(state.name, pts, document.querySelector(`[data-mission="${mission.id}"]`));
+        try {
+          await pushFeed(`📸 ${state.name} completed "${mission.title}" (+${pts})`);
+        } catch (feedError) {
+          recordError("mission.photo_feed_failed", feedError, { photoId, missionId: mission.id, pts });
+        }
       } catch (error) {
         if (postedPhoto) {
-          try { await ref(`photos/${photoId}`).remove(); } catch (rollbackError) { console.warn(rollbackError); }
+          state.optimisticPhotos = state.optimisticPhotos.filter(item => item.id !== tempId);
+          toast("Photo posted. Some points or feed updates may lag.");
+          render();
+          recordError("mission.photo_after_save_failed", error, { photoId, missionId: mission.id, stage: photoStage });
+          return;
         }
         if (wroteClaim) {
           try {
@@ -4008,6 +4175,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         state.optimisticPhotos = state.optimisticPhotos.filter(item => !item.posting);
         toast(error.message || "Photo did not post.");
         render();
+        recordError("mission.photo_post_failed", error, { photoId, missionId: mission.id, stage: photoStage });
         console.warn(error);
       }
     }
@@ -4222,6 +4390,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
       ref("missionClaims").on("value", snap => {
         state.missionClaims = snap.val() || {};
         state.loaded.claims = true;
+        hydrateClaimedPhotos();
         render();
       });
     }
@@ -4301,8 +4470,10 @@ NEXT_PUBLIC_FIREBASE_APP_ID=...</code>
         const nextPhotos = rows.sort((a, b) => (b.ts || 0) - (a.ts || 0));
         if (state.tab !== "missions" && photoWallChanged(state.photos, nextPhotos)) state.photoDot = true;
         state.photos = nextPhotos;
+        state.missingPhotoClaims = state.missingPhotoClaims.filter(claim => !knownPhotos().some(photo => photoMatchesClaim(photo, claim)));
         photosBootstrapped = true;
         state.loaded.photos = true;
+        hydrateClaimedPhotos();
         render();
       });
     }

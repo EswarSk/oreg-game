@@ -1694,6 +1694,28 @@
       font-weight: 800;
     }
 
+    .wall-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .wall-head .section-title { margin: 0; }
+    .wall-load {
+      min-height: 42px;
+      white-space: nowrap;
+    }
+    .wall-warning {
+      margin-bottom: 10px;
+      border-color: var(--ember);
+      background: #fff7eb;
+      box-shadow: 0 5px 0 rgba(242,118,46,.24);
+    }
+    .wall-warning p {
+      margin: 4px 0 0;
+    }
+
     .photo-card {
       overflow: hidden;
       border: 3px solid var(--pine);
